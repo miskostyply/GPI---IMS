@@ -1,0 +1,431 @@
+/**
+ * GPI Stock Report  (v2, 26 Oct 2026: adds Check Stock picker and Stock by Date tab)
+ * Writes the same stock numbers as the GPI Finished Goods Stock dashboard into this Google Sheet,
+ * so the manager can import them into Tally. It uses the exact same calculation as the dashboard.
+ *
+ * One-time setup: paste this file into Extensions > Apps Script of "GPI Stock Report (for Tally)",
+ * save, choose the function "setup" and press Run, then allow the permissions.
+ * After that it refreshes by itself every hour. Menu "GPI Stock > Refresh now" refreshes at once.
+ */
+
+const SRC = {
+  SKU_ID: '1kaEncrPmLT_hzzTc7lu9iIxLUbYyVxH5KNcsMDc1liM', SKU_TAB: 'FINISH GOODS',
+  PROD_ID: '1rp2zjWP_fCwk58iByfX55kFgdM0seJmfcCPs39KoYIQ', PROD_TABS: ['October', 'November', 'December'],
+  DISP_ID: '1s7iCW87CdKvKxrlXUXN0FuFG3uAGbflWhO4KWvM7dxg', DISP_TAB: 'Dispatch Log',
+  INPUTS_ID: '1LSRzYeVEdXXhlb1rqpJp4nWvZxfJuPUN0LdwRH2pdLo',
+  REPORT_ID: '1keDVcInN0170-4_DQM5kOUtCofOSpbLk6_Y1axIp7l0' // this file: GPI Stock Report (for Tally)
+};
+
+// Stock level colours (same limits as the dashboard)
+const BANDS_ = [
+  { label: '800 and above', min: 800, color: '#E4D7FF' },
+  { label: '500 to 799', min: 500, color: '#D3F2DC' },
+  { label: '200 to 499', min: 200, color: '#FFF1B8' },
+  { label: 'Below 200', min: -Infinity, color: '#FFD4D4' }
+];
+const bandOf_ = (n) => BANDS_.find((b) => n >= b.min);
+
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('GPI Stock').addItem('Refresh now', 'refreshStockReport').addToUi();
+}
+
+function setup() {
+  ScriptApp.getProjectTriggers()
+    .filter((t) => t.getHandlerFunction() === 'refreshStockReport')
+    .forEach((t) => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('refreshStockReport').timeBased().everyHours(1).create();
+  refreshStockReport();
+}
+
+function refreshStockReport() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return;
+  try {
+    const report = buildReport_(readSources_());
+    writeReport_(SpreadsheetApp.openById(SRC.REPORT_ID), report);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ---------- Reading ----------
+function readSources_() {
+  const tabOf = (ss, name) => { const sh = ss.getSheetByName(name); return sh ? sh.getDataRange().getDisplayValues() : []; };
+  const prodSS = SpreadsheetApp.openById(SRC.PROD_ID);
+  const inputs = SpreadsheetApp.openById(SRC.INPUTS_ID);
+  return {
+    skus: tabOf(SpreadsheetApp.openById(SRC.SKU_ID), SRC.SKU_TAB),
+    prodTabs: SRC.PROD_TABS.map((n) => tabOf(prodSS, n)).filter((v) => v.length),
+    disp: tabOf(SpreadsheetApp.openById(SRC.DISP_ID), SRC.DISP_TAB),
+    opening: tabOf(inputs, 'Opening Stock'),
+    corrections: tabOf(inputs, 'Corrections'),
+    names: tabOf(inputs, 'Same Names'),
+    boards: tabOf(inputs, 'Blockboard Types')
+  };
+}
+
+function iso_(s) {
+  s = String(s || '').trim();
+  let m = /^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})/.exec(s);
+  if (m) return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+  m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
+  return m ? m[1] + '-' + m[2].padStart(2, '0') + '-' + m[3].padStart(2, '0') : '';
+}
+
+function table_(v, map) {
+  const h = (v[0] || []).map((x) => String(x).trim());
+  return v.slice(1).filter((r) => r.some((c) => String(c).trim())).map((r) => {
+    const o = {};
+    Object.keys(map).forEach((k) => { const i = h.indexOf(map[k]); o[k] = i > -1 && i < r.length ? String(r[i]).trim() : ''; });
+    return o;
+  });
+}
+
+// ---------- Calculating (same steps as the dashboard) ----------
+function buildReport_(src) {
+  const skus = table_(src.skus, { cat: 'CATEGEORY', thk: 'THICKNESS', variety: 'VARIETY', glueType: 'GLUE Type', face: 'FACE', size: 'SIZE', sku: 'SKU' }).filter((r) => r.sku);
+  const production = [].concat(...src.prodTabs.map((v) => table_(v, { day: 'date', category: 'category', thickness: 'thickness', glue: 'glue', coreThick: 'coreThick', frame: 'frame', filler: 'filler', plyType: 'plyType', face: 'face', brand: 'brand', weight: 'weight', size: 'size', pcs: 'pcs' })))
+    .filter((r) => r.category && !/TEST/i.test(r.category))
+    .map((r) => Object.assign(r, { day: iso_(r.day), pcs: Number(r.pcs) || 0 }));
+  const dispatch = table_(src.disp, { ts: 'Timestamp', id: 'Dispatch ID', bill: 'Bill No', category: 'Category', thickness: 'Thickness', face: 'Face', glue: 'Glue', weight: 'Weight', size: 'Size', qty: 'Quantity', dd: 'Dispatch Date' })
+    .filter((r) => r.category)
+    .map((r) => ({ day: iso_(r.dd) || iso_(r.ts), id: r.id, bill: r.bill, category: r.category, thickness: r.thickness, face: r.face, glue: r.glue, weight: r.weight, size: r.size, qty: Number(r.qty) || 0 }));
+  const dated = (rows) => rows.map((r) => Object.assign(r, { day: iso_(r.day) }));
+  const opening = dated(table_(src.opening, { day: 'Count date', sku: 'SKU code', qty: 'Pieces', note: 'Note' }));
+  const corrections = dated(table_(src.corrections, { day: 'Date', sku: 'SKU code', qty: 'Pieces (+ add, - remove)', reason: 'Reason', by: 'Entered by' }));
+  const names = table_(src.names, { category: 'Category', from: 'Name used in apps', to: 'Same as (New SKU name)', ok: 'Confirmed (YES/NO)' });
+  const boards = table_(src.boards, { coreThick: 'Core thickness', frame: 'Frame', filler: 'Filler', type: 'New SKU type', ok: 'Confirmed (YES/NO)' });
+  return ledger_(skus, production, dispatch, opening, corrections, names, boards);
+}
+
+// The stock calculation. Keep it identical to the dashboard's "Stock ledger".
+const ledger_ = (skus, production, dispatch, opening, corrections, names, boards) => {
+  const C = (s) => String(s == null ? '' : s).toUpperCase().replace(/\s+/g, ' ').trim();
+  const N = (s) => { const m = /(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s)); return m ? String(parseFloat(m[1])) : ''; };
+  const S = (s) => { const m = /(\d+(?:\.\d+)?)[^\d.]+?(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s)); return m ? parseFloat(m[1]) + 'X' + parseFloat(m[2]) : ''; };
+  const CATS = { DOOR: 'DOOR', DOORS: 'DOOR', BLOCKBOARD: 'BLOCKBOARD', 'BLOCK BOARD': 'BLOCKBOARD', BOARD: 'BLOCKBOARD', BOARDS: 'BLOCKBOARD', PLYWOOD: 'PLYWOOD', PLY: 'PLYWOOD', SHUTTERING: 'SHUTTERING' };
+  const CAT = (s) => CATS[C(s)] || '';
+  const YES = (s) => /^Y/i.test(String(s == null ? '' : s).trim());
+  const EXAMPLE = (s) => /^EXAMPLE/i.test(String(s == null ? '' : s).trim());
+  const NICE = { DOOR: 'Door', BLOCKBOARD: 'Blockboard', PLYWOOD: 'Plywood', SHUTTERING: 'Shuttering' };
+
+  // Same Names (only rows marked YES): category|old name -> New SKU name
+  const alias = {};
+  names.forEach((r) => { if (YES(r.ok) && C(r.from) && C(r.to)) alias[(CAT(r.category) || '*') + '|' + C(r.from)] = C(r.to); });
+  const A = (cat, v) => alias[cat + '|' + v] || alias['*|' + v] || v;
+  // Blockboard Types (only rows marked YES); a blank cell means any
+  const types = boards.filter((r) => YES(r.ok) && C(r.type));
+  const boardType = (r) => {
+    const hit = {};
+    types.forEach((t) => {
+      if (C(t.coreThick) && N(t.coreThick) !== N(r.coreThick)) return;
+      if (C(t.frame) && C(t.frame) !== C(r.frame)) return;
+      if (C(t.filler) && C(t.filler) !== C(r.filler)) return;
+      hit[C(t.type)] = true;
+    });
+    const k = Object.keys(hit);
+    return k.length === 1 ? k[0] : '';
+  };
+
+  // Products = New SKU rows. A product is its details; its code(s) are labels.
+  const prod = {}, idsOfCode = {};
+  skus.forEach((r) => {
+    const cat = CAT(r.cat), thk = N(r.thk), size = S(r.size), code = C(r.sku);
+    if (!cat || !thk || !size || !code) return;
+    let id;
+    if (cat === 'SHUTTERING') {
+      const v = C(r.variety).replace(/ /g, ''), w = (/(\d+(?:\.\d+)?)KG/.exec(v) || [])[1];
+      if (!w) return;
+      const gt = C(r.glueType), glue = (gt === 'PF' || gt === 'MR') ? gt : ((/(PF|MR)$/.exec(v) || [])[1] || '*');
+      id = ['SHUTTERING', thk, N(w), glue, C(r.face), size].join('|');
+    } else id = [cat, thk, C(r.variety), C(r.face), size].join('|');
+    if (!prod[id]) prod[id] = { id, cat, codes: [], name: [NICE[cat], C(r.thk), C(r.variety), C(r.face), C(r.size)].filter(Boolean).join(' ') };
+    if (prod[id].codes.indexOf(code) === -1) prod[id].codes.push(code);
+    (idsOfCode[code] = idsOfCode[code] || {})[id] = true;
+  });
+
+  // Which product a production or dispatch row is
+  const match = (r, fromProduction) => {
+    const cat = CAT(r.category), thk = N(r.thickness), size = S(r.size);
+    if (!cat) return { why: '' };
+    if (!thk || !size) return { why: 'A product detail is empty' };
+    if (cat === 'SHUTTERING') {
+      const w = N(r.weight), g = C(r.glue), b = A(cat, C(r.face || r.brand));
+      if (!w || !b) return { why: 'A product detail is empty' };
+      const k = ['SHUTTERING', thk, w, g, b, size].join('|'), kw = ['SHUTTERING', thk, w, '*', b, size].join('|');
+      return prod[k] ? { id: k } : prod[kw] ? { id: kw } : { why: 'Not in New SKU', want: { cat, thk, weight: w, glue: g, brand: b, size } };
+    }
+    let v = C(r.glue);
+    if (fromProduction) {
+      if (cat === 'DOOR') v = /^(MR[ .-]*)?JABRA$/.test(v) ? 'JABRA' : /^MR[ .-]*FRESH$/.test(v) ? 'MR' : v;
+      else if (cat === 'PLYWOOD') {
+        const p = C(r.plyType), t = /^RED/.test(p) ? 'RED' : /^ALT/.test(p) ? 'ALT' : /GENERAL/.test(p) ? 'GENERAL' : p.replace(/ ?\b(MR|PF)$/, '');
+        v = ((t ? t + ' ' : '') + (v || (/\b(MR|PF)\b/.exec(p) || [])[1] || '')).trim();
+      } else if (/JABRA/.test(v)) v = 'JABRA';
+      else if (/PINE|MIXWOOD/.test(v)) { /* the app already wrote the New SKU type, e.g. FRESH 2.5M PINE FRAME MR */ }
+      else {
+        const t = boardType(r);
+        if (!t) return { why: 'Blockboard type not set for this Core / Frame / Filler', want: { cat, thk, glue: v === 'PF' ? 'PF' : 'MR', core: C(r.coreThick), frame: C(r.frame), filler: C(r.filler), face: A(cat, C(r.face)), size } };
+        v = t + ' ' + (v === 'PF' ? 'PF' : 'MR');
+      }
+    }
+    const k = [cat, thk, A(cat, v), A(cat, C(r.face)), size].join('|');
+    return prod[k] ? { id: k } : { why: 'Not in New SKU', want: { cat, thk, variety: A(cat, v), face: A(cat, C(r.face)), size } };
+  };
+  const byCode = (code) => {
+    const ids = Object.keys(idsOfCode[C(code)] || {});
+    return !ids.length ? { why: 'Code not in New SKU' } : ids.length > 1 ? { why: 'New SKU uses this code for ' + ids.length + ' products' } : { id: ids[0] };
+  };
+
+  // Things that could not be counted
+  const bad = {};
+  const NEXT = {
+    'Not in New SKU': 'Add the product to New SKU, or add its old name in the Same Names tab',
+    'Blockboard type not set for this Core / Frame / Filler': 'Fill in the Blockboard Types tab and type YES',
+    'A product detail is empty': 'Fix the entry in the app sheet, or add a correction',
+    'Code not in New SKU': 'Check the SKU code in the inputs sheet',
+    'Date or pieces missing': 'Check the row in the inputs sheet'
+  };
+  const raw = [];
+  const note = (source, item, why, qty, day, want) => { raw.push({ source, item, why, qty, day, want: want ? JSON.stringify(want) : '' }); };
+  const describe = (r, src) => {
+    const cat = CAT(r.category);
+    const extra = src === 'Production' && cat === 'BLOCKBOARD' ? [r.coreThick, r.frame, r.filler].filter(Boolean).join('/') : '';
+    const kind = src === 'Production' && cat === 'PLYWOOD' ? r.plyType : '';
+    return [NICE[cat] || r.category, r.thickness, cat === 'SHUTTERING' ? r.weight : '', kind, r.glue, extra, r.face || r.brand, r.size].map((x) => String(x == null ? '' : x).trim()).filter(Boolean).join(' · ');
+  };
+
+  // Movements
+  const moves = {}; // id -> day -> [produced, dispatched, corrected]
+  const add = (id, day, i, q) => { const d = (moves[id] = moves[id] || {}); (d[day] = d[day] || [0, 0, 0])[i] += q; };
+  production.forEach((r) => {
+    const q = Number(r.pcs) || 0;
+    if (!r.day || !q) return;
+    const m = match(r, true);
+    if (m.id) add(m.id, r.day, 0, q); else if (m.why) note('Production', describe(r, 'Production'), m.why, q, r.day, m.want);
+  });
+  dispatch.forEach((r) => {
+    const q = Number(r.qty) || 0;
+    if (!r.day || !q) return;
+    const m = match(r, false);
+    if (m.id) add(m.id, r.day, 1, q); else if (m.why) note('Dispatch', describe(r, 'Dispatch'), m.why, q, r.day, m.want);
+  });
+  corrections.forEach((r) => {
+    if (EXAMPLE(r.reason)) return;
+    const q = Number(r.qty);
+    if (!r.sku && !r.day) return;
+    if (!r.day || !isFinite(q) || !q) { note('Corrections tab', String(r.sku || ''), 'Date or pieces missing', 0, r.day || ''); return; }
+    const m = byCode(r.sku);
+    if (m.id) add(m.id, r.day, 2, q); else note('Corrections tab', C(r.sku), m.why, q, r.day);
+  });
+  const counts = {}; // id -> day -> pieces counted
+  opening.forEach((r) => {
+    if (EXAMPLE(r.note)) return;
+    const q = Number(r.qty);
+    if (!r.sku && !r.day) return;
+    if (!r.day || !isFinite(q)) { note('Opening Stock tab', String(r.sku || ''), 'Date or pieces missing', 0, r.day || ''); return; }
+    const m = byCode(r.sku);
+    if (!m.id) { note('Opening Stock tab', C(r.sku), m.why, q, r.day); return; }
+    const c = (counts[m.id] = counts[m.id] || {});
+    c[r.day] = (c[r.day] || 0) + q;
+  });
+  Object.keys(idsOfCode).forEach((code) => {
+    const ids = Object.keys(idsOfCode[code]);
+    if (ids.length > 1) note('New SKU', code, 'Same code used for ' + ids.length + ' products: ' + ids.map((i) => prod[i].name).join(' | '), 0, '');
+  });
+
+  // Dates: from the first count (or, with no count yet, the 1st of the latest month) to the latest entry
+  const countDays = [].concat(...Object.values(counts).map((c) => Object.keys(c))).sort();
+  const moveDays = [].concat(...Object.values(moves).map((m) => Object.keys(m))).sort();
+  const latest = [countDays[countDays.length - 1] || '', moveDays[moveDays.length - 1] || ''].sort()[1];
+  const start = countDays[0] || (latest ? latest.slice(0, 8) + '01' : '');
+  const days = [];
+  if (start) {
+    const d = new Date(start + 'T00:00:00Z'), endD = new Date(latest + 'T00:00:00Z');
+    while (d <= endD) { days.push(d.toISOString().slice(0, 10)); d.setUTCDate(d.getUTCDate() + 1); }
+  }
+
+  // Day-by-day stock for every product with a count or a movement
+  const stock = [], totals = {};
+  days.forEach((day) => { totals[day] = { day, closing: 0, produced: 0, dispatched: 0, corrected: 0, inStock: 0, belowZero: 0 }; });
+  Object.keys(prod).forEach((id) => {
+    const c = counts[id] || {}, m = moves[id] || {};
+    if (!days.some((day) => c[day] !== undefined || m[day])) return;
+    const p = prod[id];
+    let bal = 0;
+    days.forEach((day) => {
+      const open = c[day] !== undefined ? c[day] : bal;
+      const mv = m[day] || [0, 0, 0];
+      bal = open + mv[0] - mv[1] + mv[2];
+      stock.push({ key: id + '|' + day, product: id, code: p.codes.join(' / '), name: p.name, category: NICE[p.cat], day,
+        opening: open, produced: mv[0], dispatched: mv[1], corrected: mv[2], closing: bal, counted: c[day] !== undefined ? 'yes' : '' });
+      const t = totals[day];
+      t.closing += bal; t.produced += mv[0]; t.dispatched += mv[1]; t.corrected += mv[2];
+      if (bal > 0) t.inStock += 1; if (bal < 0) t.belowZero += 1;
+    });
+  });
+  raw.forEach((x) => {
+    if (x.day && start && x.day < start) return;
+    const key = x.source + '|' + x.item + '|' + x.why;
+    const b = bad[key] || (bad[key] = { key, source: x.source, item: x.item, why: x.why, qty: 0, times: 0, first: x.day, last: x.day, next: NEXT[x.why] || 'Give each product its own code in New SKU', want: x.want || '' });
+    b.qty += x.qty; b.times += 1;
+    if (x.day && (!b.first || x.day < b.first)) b.first = x.day;
+    if (x.day && (!b.last || x.day > b.last)) b.last = x.day;
+  });
+  const issues = Object.values(bad).sort((a, b) => b.qty - a.qty || b.times - a.times);
+  return {
+    info: [{ start, end: latest, counted: countDays.length > 0 ? 'yes' : 'no', products: Object.keys(prod).length, issues: issues.length }],
+    stock, totals: days.map((d) => totals[d]), issues
+  };
+};
+
+// ---------- Writing ----------
+function rowsForReport_(L) {
+  const info = L.info[0] || {};
+  const end = info.end || '';
+  const byName = (a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name);
+  const closing = L.stock.filter((r) => r.day === end).sort(byName)
+    .map((r) => [r.code, r.name, r.category, 'Pcs', r.closing, bandOf_(r.closing).label, end]);
+  const daily = L.stock.slice().sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : byName(a, b)))
+    .map((r) => [r.day, r.code, r.name, r.category, r.opening, r.produced, r.dispatched, r.corrected, r.closing]);
+  const moves = [];
+  L.stock.slice().sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : byName(a, b))).forEach((r) => {
+    const base = [r.code, r.name, r.category];
+    if (r.counted) moves.push([r.day, 'Physical Count'].concat(base, ['', '', r.opening, 'Pcs']));
+    if (r.produced) moves.push([r.day, 'Production'].concat(base, [r.produced, '', '', 'Pcs']));
+    if (r.dispatched) moves.push([r.day, 'Dispatch'].concat(base, ['', r.dispatched, '', 'Pcs']));
+    if (r.corrected > 0) moves.push([r.day, 'Stock Correction'].concat(base, [r.corrected, '', '', 'Pcs']));
+    if (r.corrected < 0) moves.push([r.day, 'Stock Correction'].concat(base, ['', -r.corrected, '', 'Pcs']));
+  });
+  const issues = L.issues.map((r) => [r.source, r.item, r.why, r.qty, r.times, r.first || '', r.last || '', r.next]);
+  // Stock by Date: one row per product, one column per date (closing stock)
+  const days = L.totals.map((t) => t.day);
+  const col = {}; days.forEach((d, i) => { col[d] = i; });
+  const grid = {};
+  L.stock.forEach((r) => {
+    const g = grid[r.product] || (grid[r.product] = { r, vals: days.map(() => '') });
+    g.vals[col[r.day]] = r.closing;
+  });
+  const matrix = Object.values(grid).sort((a, b) => byName(a.r, b.r)).map((g) => [g.r.code, g.r.name, g.r.category].concat(g.vals));
+  return { info, closing, daily, moves, issues, days, matrix };
+}
+
+function writeReport_(ss, L) {
+  ss.setSpreadsheetTimeZone(Session.getScriptTimeZone());
+  const R = rowsForReport_(L);
+  const toDate = (s) => { if (!s) return ''; const p = s.split('-'); return new Date(+p[0], +p[1] - 1, +p[2]); };
+  const put = (name, index, header, rows, dateCols, numCols) => {
+    const sh = ss.getSheetByName(name) || ss.insertSheet(name, index);
+    sh.clear();
+    const data = [header].concat(rows.map((r) => r.map((v, i) => (dateCols.indexOf(i) > -1 ? toDate(v) : v))));
+    if (sh.getMaxRows() < data.length) sh.insertRowsAfter(sh.getMaxRows(), data.length - sh.getMaxRows());
+    if (sh.getMaxColumns() < header.length) sh.insertColumnsAfter(sh.getMaxColumns(), header.length - sh.getMaxColumns());
+    sh.getRange(1, 1, data.length, header.length).setValues(data);
+    sh.getRange(1, 1, 1, header.length).setFontWeight('bold').setBackground('#EEEEEE');
+    sh.setFrozenRows(1);
+    if (rows.length) {
+      dateCols.forEach((c) => sh.getRange(2, c + 1, rows.length, 1).setNumberFormat('dd-mm-yyyy'));
+      numCols.forEach((c) => sh.getRange(2, c + 1, rows.length, 1).setNumberFormat('#,##0;-#,##0;0'));
+    }
+    return sh;
+  };
+
+  const cs = put('Closing Stock', 0, ['SKU Code', 'Item Name', 'Category', 'Unit', 'Closing Qty', 'Stock Level', 'As On'], R.closing, [6], [4]);
+  if (R.closing.length) {
+    const colours = R.closing.map((r) => { const c = bandOf_(r[4]).color; return [c, c]; });
+    cs.getRange(2, 5, R.closing.length, 2).setBackgrounds(colours);
+  }
+  put('Movements (Tally)', 1, ['Date', 'Type', 'SKU Code', 'Item Name', 'Category', 'Qty In', 'Qty Out', 'Counted Qty', 'Unit'], R.moves, [0], [5, 6, 7]);
+  put('Daily Stock', 2, ['Date', 'SKU Code', 'Item Name', 'Category', 'Opening', 'Produced', 'Dispatched', 'Correction', 'Closing'], R.daily, [0], [4, 5, 6, 7, 8]);
+  put('Needs Fixing', 3, ['Where', 'Item', 'Problem', 'Pieces', 'Times', 'First Date', 'Last Date', 'What to do'], R.issues, [5, 6], [3, 4]);
+
+  writeMatrix_(ss, R, toDate);
+  ensureCheckStock_(ss);
+
+  const about = ss.getSheetByName('About') || ss.insertSheet('About');
+  about.clear();
+  const lines = [
+    ['GPI Stock Report (for Tally)'],
+    ['Last updated: ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd-MM-yyyy HH:mm')],
+    ['Stock as on: ' + (R.info.end ? Utilities.formatDate(toDate(R.info.end), Session.getScriptTimeZone(), 'dd-MM-yyyy') : '-') + '   (stock starts from ' + (R.info.start || '-') + ')'],
+    ['Refreshes by itself every hour. Use the menu GPI Stock > Refresh now to refresh at once. Do not type in this file; it is rewritten every time.'],
+    ['Check Stock: pick a date, a product, or both, and the stock appears below. Your choices stay when the file refreshes.'],
+    ['Stock by Date: one row per product, one column per date, showing the closing stock of that day.'],
+    ['Closing Stock: one row per product with its stock at the end of the latest day, coloured like the dashboard (purple 800+, green 500-799, yellow 200-499, red below 200).'],
+    ['Movements (Tally): one row per product per day per type: Production (in), Dispatch (out), Stock Correction (in or out), Physical Count (counted pieces). Use this tab for the Tally import.'],
+    ['Daily Stock: every product, every day: opening, produced, dispatched, correction, closing.'],
+    ['Needs Fixing: entries that could not be counted, same as the dashboard.'],
+    ['Data comes from: Production - 2026, Dispatch System Database (Dispatch Log), New SKU (FINISH GOODS) and GPI IMS Inputs.']
+  ];
+  about.getRange(1, 1, lines.length, 1).setValues(lines);
+  about.getRange(1, 1).setFontWeight('bold').setFontSize(13);
+  about.setColumnWidth(1, 900);
+  about.getRange(1, 1, lines.length, 1).setWrap(true);
+
+  const blank = ss.getSheetByName('Sheet1');
+  if (blank && ss.getSheets().length > 1 && blank.getLastRow() === 0) ss.deleteSheet(blank);
+}
+
+// One row per product, one column per date, coloured by stock level
+function writeMatrix_(ss, R, toDate) {
+  const name = 'Stock by Date';
+  const sh = ss.getSheetByName(name) || ss.insertSheet(name, 1);
+  sh.clear();
+  sh.clearConditionalFormatRules();
+  const header = ['SKU Code', 'Item Name', 'Category'].concat(R.days.map(toDate));
+  const width = header.length, height = R.matrix.length + 1;
+  if (sh.getMaxRows() < height) sh.insertRowsAfter(sh.getMaxRows(), height - sh.getMaxRows());
+  if (sh.getMaxColumns() < width) sh.insertColumnsAfter(sh.getMaxColumns(), width - sh.getMaxColumns());
+  sh.getRange(1, 1, height, width).setValues([header].concat(R.matrix));
+  sh.getRange(1, 1, 1, width).setFontWeight('bold').setBackground('#EEEEEE');
+  if (R.days.length) sh.getRange(1, 4, 1, R.days.length).setNumberFormat('dd-mmm').setHorizontalAlignment('center');
+  sh.setFrozenRows(1);
+  sh.setFrozenColumns(3);
+  if (R.matrix.length && R.days.length) {
+    const body = sh.getRange(2, 4, R.matrix.length, R.days.length);
+    body.setNumberFormat('#,##0;-#,##0;0').setHorizontalAlignment('center');
+    body.setBackgrounds(R.matrix.map((row) => row.slice(3).map((v) => (v === '' ? null : bandOf_(v).color))));
+    sh.setColumnWidths(4, R.days.length, 64);
+  }
+  sh.setColumnWidth(1, 190);
+  sh.setColumnWidth(2, 330);
+  sh.setColumnWidth(3, 90);
+}
+
+// The picker tab. Made once; after that only its formulas update, so your choices stay.
+function ensureCheckStock_(ss) {
+  if (ss.getSheetByName('Check Stock')) return;
+  const sh = ss.insertSheet('Check Stock', 0);
+  const purple = BANDS_[0].color, green = BANDS_[1].color, yellow = BANDS_[2].color, red = BANDS_[3].color;
+  sh.getRange('A1').setValue('Check stock').setFontWeight('bold').setFontSize(13);
+  sh.getRange('A2:A3').setValues([['Date'], ['Product']]).setFontWeight('bold');
+  sh.getRange('B2:B3').setBackground('#FFF2CC');
+  sh.getRange('B2').setNumberFormat('dd-mm-yyyy')
+    .setDataValidation(SpreadsheetApp.newDataValidation().requireDate().setAllowInvalid(false).setHelpText('Double-click to pick a date').build());
+  sh.getRange('B3')
+    .setDataValidation(SpreadsheetApp.newDataValidation().requireValueInRange(ss.getRange("'Closing Stock'!B2:B"), true).setAllowInvalid(true).build());
+  sh.getRange('C2').setValue('Double-click to pick a date. Leave empty to see every day.');
+  sh.getRange('C3').setValue('Pick or type a product. Leave empty to see all products.');
+  sh.getRange('C2:C3').setFontColor('#666666');
+  sh.getRange('A5').setFormula('=IF(AND(B2="",B3=""),"",IF(B3="","Total closing on this date: "&TEXT(SUM(I8:I),"#,##0")&" pcs, "&COUNT(I8:I)&" products",IF(B2="","Latest closing: "&TEXT(I8,"#,##0")&" pcs","Closing: "&TEXT(I8,"#,##0")&" pcs")))').setFontWeight('bold');
+  const head = [['Date', 'SKU Code', 'Product', 'Category', 'Opening', 'Produced', 'Dispatched', 'Correction', 'Closing']];
+  sh.getRange('A7:I7').setValues(head).setFontWeight('bold').setBackground('#EEEEEE');
+  sh.getRange('A8').setFormula(
+    '=IF(AND($B$2="",$B$3=""),"Choose a date, a product, or both.",' +
+    'IFERROR(SORT(FILTER(\'Daily Stock\'!A2:I,((\'Daily Stock\'!A2:A=$B$2)+($B$2=""))*((\'Daily Stock\'!C2:C=$B$3)+($B$3=""))*(\'Daily Stock\'!A2:A<>"")),1,FALSE,4,TRUE,3,TRUE),' +
+    '"Nothing found for this choice."))');
+  sh.getRange('A8:A').setNumberFormat('dd-mm-yyyy');
+  sh.getRange('E8:I').setNumberFormat('#,##0;-#,##0;0');
+  const rng = sh.getRange('I8:I');
+  const rule = (f, c) => SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied(f).setBackground(c).setRanges([rng]).build();
+  sh.setConditionalFormatRules([
+    rule('=AND(ISNUMBER($I8),$I8>=800)', purple),
+    rule('=AND(ISNUMBER($I8),$I8>=500,$I8<800)', green),
+    rule('=AND(ISNUMBER($I8),$I8>=200,$I8<500)', yellow),
+    rule('=AND(ISNUMBER($I8),$I8<200)', red)
+  ]);
+  sh.setFrozenRows(7);
+  sh.setColumnWidth(1, 100); sh.setColumnWidth(2, 190); sh.setColumnWidth(3, 330); sh.setColumnWidth(4, 90);
+  sh.setColumnWidths(5, 5, 90);
+  ss.setActiveSheet(sh);
+}
