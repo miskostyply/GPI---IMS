@@ -1,0 +1,615 @@
+/**
+ * GPI IMS REVIEW  ·  v1, 26 Oct 2026
+ * Lives in "GPI IMS Inputs" (Extensions > Apps Script). Adds the "Review" tab.
+ *
+ * Every hour (and from the menu) it:
+ *  1. Finds every Production / Dispatch entry that does not match a New SKU product
+ *     (same check as the dashboard, the Tally report and the IMS).
+ *  2. Works out WHY and suggests the fix:
+ *       - spelling difference  -> "same as <New SKU name>"  (e.g. CONCRET ROYAL ~ CONCRET, 90% match)
+ *       - new size / weight / glue of a known product -> "add as new product" (with a new unique code)
+ *       - Blockboard Core/Frame/Filler not confirmed -> "confirm Blockboard type"
+ *       - size or detail that looks wrong -> "fix the entry"
+ *  3. Lists them in the Review tab. You and your manager discuss in "Remark", pick a
+ *     "Manager decision", and the script applies it straight away:
+ *       ✅ Approve suggestion        -> does what the Suggestion says
+ *       🔁 Same as product in col M  -> treat this entry as the product whose SKU code you pick in column M
+ *       ➕ Add as new product        -> adds it to New SKU (FINISH GOODS) with a new unique code (green row)
+ *       ✏️ Wrong entry – fix in app  -> nothing is changed; fix the entry or add a correction
+ *       🚫 Ignore                    -> leave it out
+ *  Name merges go into "Same Names", new products into New SKU, Blockboard types into "Blockboard Types".
+ *  The dashboard, the Tally report and the IMS read those, so all of them update together.
+ *
+ * Setup once: paste this file, Save, pick "setup" and press Run, allow permissions.
+ */
+
+const SRC = {
+  PROD_ID: '1rp2zjWP_fCwk58iByfX55kFgdM0seJmfcCPs39KoYIQ',      // Production - 2026
+  DISP_ID: '1s7iCW87CdKvKxrlXUXN0FuFG3uAGbflWhO4KWvM7dxg', DISP_TAB: 'Dispatch Log',
+  SKU_ID: '1kaEncrPmLT_hzzTc7lu9iIxLUbYyVxH5KNcsMDc1liM', SKU_TAB: 'FINISH GOODS', // New SKU
+  INPUTS_ID: '1LSRzYeVEdXXhlb1rqpJp4nWvZxfJuPUN0LdwRH2pdLo'                      // this file
+};
+const REVIEW_TAB = 'Review';
+const HEAD = ['ID', 'Found in', 'Entered as', 'Problem', 'Suggestion', 'Match %', 'Suggested action', 'Pieces', 'Entries', 'First date', 'Last date',
+  'Manager decision', 'Correct product (SKU code, only for 🔁)', 'Remark / discussion', 'Decided by', 'Status', 'Key', 'Data'];
+const COL = {}; HEAD.forEach((h, i) => { COL[h] = i; });
+const D = { PENDING: '⏳ Pending', APPROVE: '✅ Approve suggestion', SAME: '🔁 Same as product in column M', ADD: '➕ Add as new product', FIX: '✏️ Wrong entry – fix in app', IGNORE: '🚫 Ignore' };
+const SPELL_MIN = 0.72;   // how alike two names must be to call it a spelling difference
+const MONTHS = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER'];
+const NICE = { DOOR: 'Door', BLOCKBOARD: 'Blockboard', PLYWOOD: 'Plywood', SHUTTERING: 'Shuttering' };
+
+/************ MENU & TRIGGERS ************/
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('🧠 IMS Review')
+    .addItem('🔄 Refresh review list', 'refreshReview')
+    .addItem('✅ Apply approved decisions now', 'applyAndRefresh')
+    .addToUi();
+}
+
+function setup() {
+  const ss = SpreadsheetApp.openById(SRC.INPUTS_ID);
+  ScriptApp.getProjectTriggers().forEach((t) => { if (['refreshReview', 'onReviewEdit', 'applyAndRefresh'].indexOf(t.getHandlerFunction()) > -1) ScriptApp.deleteTrigger(t); });
+  ScriptApp.newTrigger('applyAndRefresh').timeBased().everyHours(1).create();
+  ScriptApp.newTrigger('onReviewEdit').forSpreadsheet(ss).onEdit().create();
+  const sh = ss.getSheetByName(REVIEW_TAB);
+  if (sh) formatReviewTab_(ss, sh); else makeReviewTab_(ss);
+  refreshReview();
+}
+
+/** Runs when someone edits this file: a decision on the Review tab is applied at once. */
+function onReviewEdit(e) {
+  if (!e || !e.range) return;
+  const sh = e.range.getSheet();
+  if (sh.getName() !== REVIEW_TAB || e.range.getRow() < 2) return;
+  const c = e.range.getColumn();
+  if (c !== COL['Manager decision'] + 1 && c !== COL['Correct product (SKU code, only for 🔁)'] + 1) return;
+  const row = e.range.getRow();
+  if (!sh.getRange(row, COL['Decided by'] + 1).getValue()) {
+    const who = (e.user && e.user.getEmail && e.user.getEmail()) || Session.getActiveUser().getEmail() || '';
+    if (who) sh.getRange(row, COL['Decided by'] + 1).setValue(who);
+  }
+  applyAndRefresh();
+}
+
+function applyAndRefresh() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(60000)) return;
+  try {
+    const n = applyDecisions_();
+    buildReview_();
+    if (n) SpreadsheetApp.openById(SRC.INPUTS_ID).toast(n + ' decision(s) applied.', 'IMS Review', 6);
+  } finally { lock.releaseLock(); }
+}
+
+function refreshReview() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(60000)) return;
+  try { buildReview_(); } finally { lock.releaseLock(); }
+}
+
+/************ READING (same sources and rules as the dashboard) ************/
+function readSources_() {
+  const tabOf = (ss, name) => { const sh = ss.getSheetByName(name); return sh ? sh.getDataRange().getDisplayValues() : []; };
+  const prodSS = SpreadsheetApp.openById(SRC.PROD_ID);
+  const inputs = SpreadsheetApp.openById(SRC.INPUTS_ID);
+  return {
+    skus: tabOf(SpreadsheetApp.openById(SRC.SKU_ID), SRC.SKU_TAB),
+    prodTabs: prodSS.getSheets().filter((sh) => MONTHS.indexOf(String(sh.getName()).trim().toUpperCase()) > -1).map((sh) => sh.getDataRange().getDisplayValues()),
+    disp: tabOf(SpreadsheetApp.openById(SRC.DISP_ID), SRC.DISP_TAB),
+    opening: tabOf(inputs, 'Opening Stock'), corrections: tabOf(inputs, 'Corrections'),
+    names: tabOf(inputs, 'Same Names'), boards: tabOf(inputs, 'Blockboard Types')
+  };
+}
+function iso_(s) {
+  s = String(s || '').trim();
+  let m = /^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})/.exec(s);
+  if (m) return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+  m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
+  return m ? m[1] + '-' + m[2].padStart(2, '0') + '-' + m[3].padStart(2, '0') : '';
+}
+function table_(v, map) {
+  const h = (v[0] || []).map((x) => String(x).trim());
+  return v.slice(1).filter((r) => r.some((c) => String(c).trim())).map((r) => {
+    const o = {};
+    Object.keys(map).forEach((k) => { const i = h.indexOf(map[k]); o[k] = i > -1 && i < r.length ? String(r[i]).trim() : ''; });
+    return o;
+  });
+}
+function skuRows_(v) { return table_(v, { cat: 'CATEGEORY', thk: 'THICKNESS', variety: 'VARIETY', glueType: 'GLUE Type', face: 'FACE', size: 'SIZE', sku: 'SKU' }).filter((r) => r.sku); }
+function buildLedger_(src) {
+  const production = [].concat(...src.prodTabs.map((v) => table_(v, { day: 'date', category: 'category', thickness: 'thickness', glue: 'glue', coreThick: 'coreThick', frame: 'frame', filler: 'filler', plyType: 'plyType', face: 'face', brand: 'brand', weight: 'weight', size: 'size', pcs: 'pcs' })))
+    .filter((r) => r.category && !/TEST/i.test(r.category)).map((r) => Object.assign(r, { day: iso_(r.day), pcs: Number(r.pcs) || 0 }));
+  const dispatch = table_(src.disp, { ts: 'Timestamp', id: 'Dispatch ID', bill: 'Bill No', category: 'Category', thickness: 'Thickness', face: 'Face', glue: 'Glue', weight: 'Weight', size: 'Size', qty: 'Quantity', dd: 'Dispatch Date' })
+    .filter((r) => r.category).map((r) => ({ day: iso_(r.dd) || iso_(r.ts), id: r.id, bill: r.bill, category: r.category, thickness: r.thickness, face: r.face, glue: r.glue, weight: r.weight, size: r.size, qty: Number(r.qty) || 0 }));
+  const dated = (rows) => rows.map((r) => Object.assign(r, { day: iso_(r.day) }));
+  return ledger_(skuRows_(src.skus), production, dispatch,
+    dated(table_(src.opening, { day: 'Count date', sku: 'SKU code', qty: 'Pieces', note: 'Note' })),
+    dated(table_(src.corrections, { day: 'Date', sku: 'SKU code', qty: 'Pieces (+ add, - remove)', reason: 'Reason', by: 'Entered by' })),
+    table_(src.names, { category: 'Category', from: 'Name used in apps', to: 'Same as (New SKU name)', ok: 'Confirmed (YES/NO)' }),
+    table_(src.boards, { coreThick: 'Core thickness', frame: 'Frame', filler: 'Filler', type: 'New SKU type', ok: 'Confirmed (YES/NO)' }));
+}
+
+// The stock calculation. Keep it identical to the dashboard's "Stock ledger".
+const ledger_ = (skus, production, dispatch, opening, corrections, names, boards) => {
+  const C = (s) => String(s == null ? '' : s).toUpperCase().replace(/\s+/g, ' ').trim();
+  const N = (s) => { const m = /(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s)); return m ? String(parseFloat(m[1])) : ''; };
+  const S = (s) => { const m = /(\d+(?:\.\d+)?)[^\d.]+?(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s)); return m ? parseFloat(m[1]) + 'X' + parseFloat(m[2]) : ''; };
+  const CATS = { DOOR: 'DOOR', DOORS: 'DOOR', BLOCKBOARD: 'BLOCKBOARD', 'BLOCK BOARD': 'BLOCKBOARD', BOARD: 'BLOCKBOARD', BOARDS: 'BLOCKBOARD', PLYWOOD: 'PLYWOOD', PLY: 'PLYWOOD', SHUTTERING: 'SHUTTERING' };
+  const CAT = (s) => CATS[C(s)] || '';
+  const YES = (s) => /^Y/i.test(String(s == null ? '' : s).trim());
+  const EXAMPLE = (s) => /^EXAMPLE/i.test(String(s == null ? '' : s).trim());
+  const NICE = { DOOR: 'Door', BLOCKBOARD: 'Blockboard', PLYWOOD: 'Plywood', SHUTTERING: 'Shuttering' };
+
+  // Same Names (only rows marked YES): category|old name -> New SKU name
+  const alias = {};
+  names.forEach((r) => { if (YES(r.ok) && C(r.from) && C(r.to)) alias[(CAT(r.category) || '*') + '|' + C(r.from)] = C(r.to); });
+  const A = (cat, v) => alias[cat + '|' + v] || alias['*|' + v] || v;
+  // Blockboard Types (only rows marked YES); a blank cell means any
+  const types = boards.filter((r) => YES(r.ok) && C(r.type));
+  const boardType = (r) => {
+    const hit = {};
+    types.forEach((t) => {
+      if (C(t.coreThick) && N(t.coreThick) !== N(r.coreThick)) return;
+      if (C(t.frame) && C(t.frame) !== C(r.frame)) return;
+      if (C(t.filler) && C(t.filler) !== C(r.filler)) return;
+      hit[C(t.type)] = true;
+    });
+    const k = Object.keys(hit);
+    return k.length === 1 ? k[0] : '';
+  };
+
+  // Products = New SKU rows. A product is its details; its code(s) are labels.
+  const prod = {}, idsOfCode = {};
+  skus.forEach((r) => {
+    const cat = CAT(r.cat), thk = N(r.thk), size = S(r.size), code = C(r.sku);
+    if (!cat || !thk || !size || !code) return;
+    let id;
+    if (cat === 'SHUTTERING') {
+      const v = C(r.variety).replace(/ /g, ''), w = (/(\d+(?:\.\d+)?)KG/.exec(v) || [])[1];
+      if (!w) return;
+      const gt = C(r.glueType), glue = (gt === 'PF' || gt === 'MR') ? gt : ((/(PF|MR)$/.exec(v) || [])[1] || '*');
+      id = ['SHUTTERING', thk, N(w), glue, C(r.face), size].join('|');
+    } else id = [cat, thk, C(r.variety), C(r.face), size].join('|');
+    if (!prod[id]) prod[id] = { id, cat, codes: [], name: [NICE[cat], C(r.thk), C(r.variety), C(r.face), C(r.size)].filter(Boolean).join(' ') };
+    if (prod[id].codes.indexOf(code) === -1) prod[id].codes.push(code);
+    (idsOfCode[code] = idsOfCode[code] || {})[id] = true;
+  });
+
+  // Which product a production or dispatch row is
+  const match = (r, fromProduction) => {
+    const cat = CAT(r.category), thk = N(r.thickness), size = S(r.size);
+    if (!cat) return { why: '' };
+    if (!thk || !size) return { why: 'A product detail is empty' };
+    if (cat === 'SHUTTERING') {
+      const w = N(r.weight), g = C(r.glue), b = A(cat, C(r.face || r.brand));
+      if (!w || !b) return { why: 'A product detail is empty' };
+      const k = ['SHUTTERING', thk, w, g, b, size].join('|'), kw = ['SHUTTERING', thk, w, '*', b, size].join('|');
+      return prod[k] ? { id: k } : prod[kw] ? { id: kw } : { why: 'Not in New SKU', want: { cat, thk, weight: w, glue: g, brand: b, size } };
+    }
+    let v = C(r.glue);
+    if (fromProduction) {
+      if (cat === 'DOOR') v = /^(MR[ .-]*)?JABRA$/.test(v) ? 'JABRA' : /^MR[ .-]*FRESH$/.test(v) ? 'MR' : v;
+      else if (cat === 'PLYWOOD') {
+        const p = C(r.plyType), t = /^RED/.test(p) ? 'RED' : /^ALT/.test(p) ? 'ALT' : /GENERAL/.test(p) ? 'GENERAL' : p.replace(/ ?\b(MR|PF)$/, '');
+        v = ((t ? t + ' ' : '') + (v || (/\b(MR|PF)\b/.exec(p) || [])[1] || '')).trim();
+      } else if (/JABRA/.test(v)) v = 'JABRA';
+      else if (/PINE|MIXWOOD/.test(v)) { /* the app already wrote the New SKU type, e.g. FRESH 2.5M PINE FRAME MR */ }
+      else {
+        const t = boardType(r);
+        if (!t) return { why: 'Blockboard type not set for this Core / Frame / Filler', want: { cat, thk, glue: v === 'PF' ? 'PF' : 'MR', core: C(r.coreThick), frame: C(r.frame), filler: C(r.filler), face: A(cat, C(r.face)), size } };
+        v = t + ' ' + (v === 'PF' ? 'PF' : 'MR');
+      }
+    }
+    const k = [cat, thk, A(cat, v), A(cat, C(r.face)), size].join('|');
+    return prod[k] ? { id: k } : { why: 'Not in New SKU', want: { cat, thk, variety: A(cat, v), face: A(cat, C(r.face)), size } };
+  };
+  const byCode = (code) => {
+    const ids = Object.keys(idsOfCode[C(code)] || {});
+    return !ids.length ? { why: 'Code not in New SKU' } : ids.length > 1 ? { why: 'New SKU uses this code for ' + ids.length + ' products' } : { id: ids[0] };
+  };
+
+  // Things that could not be counted
+  const bad = {};
+  const NEXT = {
+    'Not in New SKU': 'Add the product to New SKU, or add its old name in the Same Names tab',
+    'Blockboard type not set for this Core / Frame / Filler': 'Fill in the Blockboard Types tab and type YES',
+    'A product detail is empty': 'Fix the entry in the app sheet, or add a correction',
+    'Code not in New SKU': 'Check the SKU code in the inputs sheet',
+    'Date or pieces missing': 'Check the row in the inputs sheet'
+  };
+  const raw = [];
+  const note = (source, item, why, qty, day, want) => { raw.push({ source, item, why, qty, day, want: want ? JSON.stringify(want) : '' }); };
+  const describe = (r, src) => {
+    const cat = CAT(r.category);
+    const extra = src === 'Production' && cat === 'BLOCKBOARD' ? [r.coreThick, r.frame, r.filler].filter(Boolean).join('/') : '';
+    const kind = src === 'Production' && cat === 'PLYWOOD' ? r.plyType : '';
+    return [NICE[cat] || r.category, r.thickness, cat === 'SHUTTERING' ? r.weight : '', kind, r.glue, extra, r.face || r.brand, r.size].map((x) => String(x == null ? '' : x).trim()).filter(Boolean).join(' · ');
+  };
+
+  // Movements
+  const moves = {}; // id -> day -> [produced, dispatched, corrected]
+  const add = (id, day, i, q) => { const d = (moves[id] = moves[id] || {}); (d[day] = d[day] || [0, 0, 0])[i] += q; };
+  production.forEach((r) => {
+    const q = Number(r.pcs) || 0;
+    if (!r.day || !q) return;
+    const m = match(r, true);
+    if (m.id) add(m.id, r.day, 0, q); else if (m.why) note('Production', describe(r, 'Production'), m.why, q, r.day, m.want);
+  });
+  dispatch.forEach((r) => {
+    const q = Number(r.qty) || 0;
+    if (!r.day || !q) return;
+    const m = match(r, false);
+    if (m.id) add(m.id, r.day, 1, q); else if (m.why) note('Dispatch', describe(r, 'Dispatch'), m.why, q, r.day, m.want);
+  });
+  corrections.forEach((r) => {
+    if (EXAMPLE(r.reason)) return;
+    const q = Number(r.qty);
+    if (!r.sku && !r.day) return;
+    if (!r.day || !isFinite(q) || !q) { note('Corrections tab', String(r.sku || ''), 'Date or pieces missing', 0, r.day || ''); return; }
+    const m = byCode(r.sku);
+    if (m.id) add(m.id, r.day, 2, q); else note('Corrections tab', C(r.sku), m.why, q, r.day);
+  });
+  const counts = {}; // id -> day -> pieces counted
+  opening.forEach((r) => {
+    if (EXAMPLE(r.note)) return;
+    const q = Number(r.qty);
+    if (!r.sku && !r.day) return;
+    if (!r.day || !isFinite(q)) { note('Opening Stock tab', String(r.sku || ''), 'Date or pieces missing', 0, r.day || ''); return; }
+    const m = byCode(r.sku);
+    if (!m.id) { note('Opening Stock tab', C(r.sku), m.why, q, r.day); return; }
+    const c = (counts[m.id] = counts[m.id] || {});
+    c[r.day] = (c[r.day] || 0) + q;
+  });
+  Object.keys(idsOfCode).forEach((code) => {
+    const ids = Object.keys(idsOfCode[code]);
+    if (ids.length > 1) note('New SKU', code, 'Same code used for ' + ids.length + ' products: ' + ids.map((i) => prod[i].name).join(' | '), 0, '');
+  });
+
+  // Dates: from the first count (or, with no count yet, the 1st of the latest month) to the latest entry
+  const countDays = [].concat(...Object.values(counts).map((c) => Object.keys(c))).sort();
+  const moveDays = [].concat(...Object.values(moves).map((m) => Object.keys(m))).sort();
+  const latest = [countDays[countDays.length - 1] || '', moveDays[moveDays.length - 1] || ''].sort()[1];
+  const start = countDays[0] || (latest ? latest.slice(0, 8) + '01' : '');
+  const days = [];
+  if (start) {
+    const d = new Date(start + 'T00:00:00Z'), endD = new Date(latest + 'T00:00:00Z');
+    while (d <= endD) { days.push(d.toISOString().slice(0, 10)); d.setUTCDate(d.getUTCDate() + 1); }
+  }
+
+  // Day-by-day stock for every product with a count or a movement
+  const stock = [], totals = {};
+  days.forEach((day) => { totals[day] = { day, closing: 0, produced: 0, dispatched: 0, corrected: 0, inStock: 0, belowZero: 0 }; });
+  Object.keys(prod).forEach((id) => {
+    const c = counts[id] || {}, m = moves[id] || {};
+    if (!days.some((day) => c[day] !== undefined || m[day])) return;
+    const p = prod[id];
+    let bal = 0;
+    days.forEach((day) => {
+      const open = c[day] !== undefined ? c[day] : bal;
+      const mv = m[day] || [0, 0, 0];
+      bal = open + mv[0] - mv[1] + mv[2];
+      stock.push({ key: id + '|' + day, product: id, code: p.codes.join(' / '), name: p.name, category: NICE[p.cat], day,
+        opening: open, produced: mv[0], dispatched: mv[1], corrected: mv[2], closing: bal, counted: c[day] !== undefined ? 'yes' : '' });
+      const t = totals[day];
+      t.closing += bal; t.produced += mv[0]; t.dispatched += mv[1]; t.corrected += mv[2];
+      if (bal > 0) t.inStock += 1; if (bal < 0) t.belowZero += 1;
+    });
+  });
+  raw.forEach((x) => {
+    if (x.day && start && x.day < start) return;
+    const key = x.source + '|' + x.item + '|' + x.why;
+    const b = bad[key] || (bad[key] = { key, source: x.source, item: x.item, why: x.why, qty: 0, times: 0, first: x.day, last: x.day, next: NEXT[x.why] || 'Give each product its own code in New SKU', want: x.want || '' });
+    b.qty += x.qty; b.times += 1;
+    if (x.day && (!b.first || x.day < b.first)) b.first = x.day;
+    if (x.day && (!b.last || x.day > b.last)) b.last = x.day;
+  });
+  const issues = Object.values(bad).sort((a, b) => b.qty - a.qty || b.times - a.times);
+  return {
+    info: [{ start, end: latest, counted: countDays.length > 0 ? 'yes' : 'no', products: Object.keys(prod).length, issues: issues.length }],
+    stock, totals: days.map((d) => totals[d]), issues
+  };
+};
+
+/************ THE SPELLING CHECK ************/
+const C_ = (s) => String(s == null ? '' : s).toUpperCase().replace(/\s+/g, ' ').trim();
+const N_ = (s) => { const m = /(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s)); return m ? String(parseFloat(m[1])) : ''; };
+const S_ = (s) => { const m = /(\d+(?:\.\d+)?)[^\d.]+?(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s)); return m ? parseFloat(m[1]) + 'X' + parseFloat(m[2]) : ''; };
+const CAT_ = (s) => ({ DOOR: 'DOOR', DOORS: 'DOOR', BLOCKBOARD: 'BLOCKBOARD', 'BLOCK BOARD': 'BLOCKBOARD', BOARD: 'BLOCKBOARD', BOARDS: 'BLOCKBOARD', PLYWOOD: 'PLYWOOD', PLY: 'PLYWOOD', SHUTTERING: 'SHUTTERING' })[C_(s)] || '';
+
+/** How alike two names are, 0 to 1 (1 = same). Ignores spaces and dots. */
+function similarity_(a, b) {
+  a = C_(a).replace(/[^A-Z0-9]/g, ''); b = C_(b).replace(/[^A-Z0-9]/g, '');
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (Math.min(a.length, b.length) >= 4 && (a.indexOf(b) === 0 || b.indexOf(a) === 0)) return 0.9;
+  const m = a.length, n = b.length, d = [];
+  for (let i = 0; i <= m; i++) { d[i] = [i]; }
+  for (let j = 1; j <= n; j++) d[0][j] = j;
+  for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++) {
+    d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+  }
+  return Math.max(0, 1 - d[m][n] / Math.max(m, n));
+}
+
+/** Everything New SKU knows, for suggestions and for making new codes. */
+function catalog_(skuValues) {
+  const rows = skuRows_(skuValues).map((r) => {
+    const cat = CAT_(r.cat), thk = N_(r.thk), size = S_(r.size), code = C_(r.sku);
+    if (cat === 'SHUTTERING') {
+      const v = C_(r.variety).replace(/ /g, ''), w = N_((/(\d+(?:\.\d+)?)KG/.exec(v) || [])[1]);
+      const gt = C_(r.glueType), glue = (gt === 'PF' || gt === 'MR') ? gt : ((/(PF|MR)$/.exec(v) || [])[1] || '*');
+      return { cat, thk, weight: w, glue, brand: C_(r.face), size, code, raw: r };
+    }
+    return { cat, thk, variety: C_(r.variety), face: C_(r.face), size, code, glueType: C_(r.glueType), raw: r };
+  }).filter((r) => r.cat && r.code);
+  const names = { variety: {}, face: {}, brand: {} };
+  rows.forEach((r) => {
+    if (r.cat === 'SHUTTERING') (names.brand[r.cat] = names.brand[r.cat] || {})[r.brand] = true;
+    else { (names.variety[r.cat] = names.variety[r.cat] || {})[r.variety] = true; (names.face[r.cat] = names.face[r.cat] || {})[r.face] = true; }
+  });
+  const sizes = {}; rows.forEach((r) => { (sizes[r.cat] = sizes[r.cat] || {})[r.size] = true; });
+  return { rows, names, sizes, codes: rows.reduce((m, r) => { m[r.code] = r; return m; }, {}) };
+}
+
+function closest_(name, pool) {
+  const out = Object.keys(pool || {}).map((p) => ({ name: p, score: similarity_(name, p) })).sort((a, b) => b.score - a.score);
+  return out.slice(0, 2);
+}
+
+function sizeLooksWrong_(cat, size) {
+  const m = /^(\d+(?:\.\d+)?)X(\d+(?:\.\d+)?)$/.exec(size || '');
+  if (!m) return true;
+  const a = +m[1], b = +m[2];
+  if (cat === 'DOOR') return a < 60 || a > 110 || b < 12 || b > 60;
+  return a > 10 || b > 5 || a < b;
+}
+
+/**
+ * Works out the problem and the suggestion for one unmatched entry.
+ * Returns { problem, suggestion, match, action, data } — data says exactly what approving will do.
+ */
+function suggest_(issue, cat_, boardsValues) {
+  const want = issue.want ? JSON.parse(issue.want) : null;
+  const pct = (x) => Math.round(x * 100);
+  if (issue.why === 'Blockboard type not set for this Core / Frame / Filler' && want) {
+    const B = table_(boardsValues, { coreThick: 'Core thickness', frame: 'Frame', filler: 'Filler', type: 'New SKU type', ok: 'Confirmed (YES/NO)' });
+    let hit = -1;
+    B.forEach((t, i) => {
+      if (hit > -1 || !C_(t.type)) return;
+      if (C_(t.coreThick) && N_(t.coreThick) !== N_(want.core)) return;
+      if (C_(t.frame) && C_(t.frame) !== C_(want.frame)) return;
+      if (C_(t.filler) && C_(t.filler) !== C_(want.filler)) return;
+      hit = i;
+    });
+    const what = [want.core, want.frame, want.filler].join(' / ');
+    if (hit > -1) return { problem: 'Blockboard type not confirmed for ' + what, suggestion: what + ' = ' + C_(B[hit].type), match: '', action: 'Confirm the Blockboard type', data: { kind: 'board', row: hit + 2 } };
+    return { problem: 'No Blockboard type for ' + what, suggestion: 'Pick the right Blockboard product in column M and choose 🔁', match: '', action: 'Tell which type this is', data: { kind: 'boardNew', want } };
+  }
+  if (issue.why !== 'Not in New SKU' || !want) {
+    return { problem: issue.why, suggestion: issue.next, match: '', action: 'Fix the entry', data: { kind: 'fix' } };
+  }
+  const cat = want.cat;
+  if (sizeLooksWrong_(cat, want.size)) return { problem: 'Size ' + want.size + ' looks wrong for ' + NICE[cat], suggestion: 'Check the entry; the size was probably typed wrong', match: '', action: 'Fix the entry', data: { kind: 'fix' } };
+  const exists = (f) => cat_.rows.some(f);
+  if (cat === 'SHUTTERING') {
+    const known = (cat_.names.brand[cat] || {})[want.brand];
+    if (!known) {
+      const best = closest_(want.brand, cat_.names.brand[cat]);
+      if (best[0] && best[0].score >= SPELL_MIN) {
+        const alt = best[1] && best[1].score >= SPELL_MIN && best[0].score - best[1].score < 0.05 ? ' (or ' + best[1].name + '?)' : '';
+        return { problem: 'Brand "' + want.brand + '" is not in New SKU — looks like a spelling difference', suggestion: 'Same brand as ' + best[0].name + alt, match: pct(best[0].score), action: 'Merge the name', data: { kind: 'alias', category: 'Shuttering', from: want.brand, to: best[0].name } };
+      }
+      return { problem: 'New brand "' + want.brand + '"', suggestion: 'Add ' + want.brand + ' ' + want.weight + 'KG ' + want.glue + ' ' + want.size + ' as a new product', match: '', action: 'Add new product', data: { kind: 'new', want } };
+    }
+    const sameAll = exists((r) => r.cat === cat && r.brand === want.brand && r.weight === want.weight && r.size === want.size && r.thk === want.thk);
+    const what = sameAll ? 'glue ' + want.glue : (exists((r) => r.cat === cat && r.brand === want.brand && r.weight === want.weight) ? 'size ' + want.size : 'weight ' + want.weight + 'KG');
+    return { problem: want.brand + ' is known, but not with ' + what, suggestion: 'Add ' + want.brand + ' ' + want.weight + 'KG ' + want.glue + ' ' + want.size + ' as a new product', match: '', action: 'Add new product', data: { kind: 'new', want } };
+  }
+  const vKnown = (cat_.names.variety[cat] || {})[want.variety], fKnown = (cat_.names.face[cat] || {})[want.face];
+  if (!vKnown || !fKnown) {
+    const field = !vKnown ? 'variety' : 'face', name = want[field];
+    const best = closest_(name, cat_.names[field][cat]);
+    if (best[0] && best[0].score >= SPELL_MIN) {
+      const alt = best[1] && best[1].score >= SPELL_MIN && best[0].score - best[1].score < 0.05 ? ' (or ' + best[1].name + '?)' : '';
+      return { problem: (field === 'variety' ? 'Type' : 'Face') + ' "' + name + '" is not in New SKU — looks like a spelling difference', suggestion: 'Same as ' + best[0].name + alt, match: pct(best[0].score), action: 'Merge the name', data: { kind: 'alias', category: NICE[cat], from: name, to: best[0].name } };
+    }
+    return { problem: 'New ' + (field === 'variety' ? 'type' : 'face') + ' "' + name + '" for ' + NICE[cat], suggestion: 'Add as a new product, or pick the right product in column M', match: '', action: 'Add new product', data: { kind: 'new', want } };
+  }
+  const near = cat_.rows.filter((r) => r.cat === cat && r.variety === want.variety && r.face === want.face && r.thk === want.thk).map((r) => r.size);
+  return { problem: 'Size ' + want.size + ' (' + want.thk + 'mm) is not in New SKU for ' + NICE[cat] + ' ' + want.variety + ' ' + want.face, suggestion: 'Add ' + NICE[cat] + ' ' + want.thk + 'MM ' + want.variety + ' ' + want.face + ' ' + want.size + ' as a new product' + (near.length ? '' : ' (new thickness too)'), match: '', action: 'Add new product', data: { kind: 'new', want } };
+}
+
+/************ NEW PRODUCT ROW + UNIQUE CODE (learns the pattern from similar New SKU rows) ************/
+function newSkuRow_(want, cat_) {
+  const cat = want.cat, prefix = { DOOR: 'DO', BLOCKBOARD: 'BL', PLYWOOD: 'PL', SHUTTERING: 'SH' }[cat];
+  const seg = (code) => code.split('-');
+  const abbr = (name, used) => {
+    const clean = C_(name).replace(/[^A-Z0-9 ]/g, '');
+    const tries = [clean.replace(/ /g, '').slice(0, 3), clean.split(' ').map((w) => w[0]).join('').slice(0, 3), clean.replace(/[AEIOU ]/g, '').slice(0, 3)];
+    for (const t of tries) if (t && !used[t]) return t;
+    return clean.replace(/ /g, '').slice(0, 2) + Object.keys(used).length;
+  };
+  let row, code;
+  if (cat === 'SHUTTERING') {
+    const same = cat_.rows.filter((r) => r.cat === cat && r.brand === want.brand);
+    const used = {}; cat_.rows.filter((r) => r.cat === cat && r.brand !== want.brand).forEach((r) => { used[seg(r.code)[4]] = true; });
+    const br = same.length ? seg(same[0].code)[4] : abbr(want.brand, used);
+    code = ['SH', want.thk, want.weight + 'K', want.glue, br, want.size].join('-');
+    row = ['SHUTTERING', want.thk + 'MM', want.weight + 'KG' + want.glue, want.glue, want.brand, want.size];
+  } else {
+    const sib = cat_.rows.find((r) => r.cat === cat && r.variety === want.variety && r.face === want.face && r.thk === want.thk)
+      || cat_.rows.find((r) => r.cat === cat && r.variety === want.variety && r.face === want.face)
+      || cat_.rows.find((r) => r.cat === cat && r.variety === want.variety);
+    const glue = sib ? sib.glueType : (/PF$/.test(want.variety) || want.variety === 'PF' ? 'PF' : 'MR');
+    if (sib) {
+      const s = seg(sib.code);
+      s[1] = want.thk; s[s.length - 1] = want.size;
+      if (sib.face !== want.face) s[s.length - 2] = abbr(want.face, {});
+      code = s.join('-');
+    } else {
+      code = [prefix, want.thk, abbr(want.variety, {}), glue, abbr(want.face, {}), want.size].filter(Boolean).join('-');
+    }
+    row = [cat, want.thk + 'MM', want.variety, glue, want.face, want.size];
+  }
+  let unique = code, n = 2;
+  while (cat_.codes[unique]) unique = code + '-' + (n++);
+  return row.concat([unique]);
+}
+
+/************ APPLYING DECISIONS ************/
+function applyDecisions_() {
+  const ss = SpreadsheetApp.openById(SRC.INPUTS_ID);
+  const sh = ss.getSheetByName(REVIEW_TAB);
+  if (!sh || sh.getLastRow() < 2) return 0;
+  const vals = sh.getRange(2, 1, sh.getLastRow() - 1, HEAD.length).getValues();
+  const skuSS = SpreadsheetApp.openById(SRC.SKU_ID), skuSh = skuSS.getSheetByName(SRC.SKU_TAB);
+  let cat_ = catalog_(skuSh.getDataRange().getDisplayValues());
+  const namesSh = ss.getSheetByName('Same Names'), boardsSh = ss.getSheetByName('Blockboard Types');
+  const today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd-MM-yyyy');
+  let applied = 0;
+  vals.forEach((v, i) => {
+    const decision = String(v[COL['Manager decision']]), status = String(v[COL['Status']]);
+    if (/^Done|^Ignored/.test(status)) return;
+    let data = {}; try { data = JSON.parse(v[COL['Data']] || '{}'); } catch (e) { data = {}; }
+    const id = v[COL['ID']], by = v[COL['Decided by']] || '';
+    const note = 'Approved in Review #' + id + ' on ' + today + (by ? ' by ' + by : '');
+    let result = '';
+    if (decision === D.APPROVE) {
+      if (data.kind === 'alias') { namesSh.appendRow([data.category, data.from, data.to, 'YES', note]); result = 'Done ✔ ' + data.from + ' now counted as ' + data.to; }
+      else if (data.kind === 'new') { const r = newSkuRow_(data.want, cat_); addSku_(skuSh, r); cat_ = catalog_(skuSh.getDataRange().getDisplayValues()); result = 'Done ✔ added to New SKU as ' + r[6]; }
+      else if (data.kind === 'board') { boardsSh.getRange(data.row, 5).setValue('YES'); result = 'Done ✔ Blockboard type confirmed'; }
+      else result = 'Nothing to approve here — choose ✏️ or 🔁';
+    } else if (decision === D.ADD) {
+      if (data.want && data.kind !== 'board' && data.kind !== 'boardNew' && data.want.size) { const r = newSkuRow_(data.want, cat_); addSku_(skuSh, r); cat_ = catalog_(skuSh.getDataRange().getDisplayValues()); result = 'Done ✔ added to New SKU as ' + r[6]; }
+      else result = 'Can\'t add this one as a product — choose ✏️ or 🔁';
+    } else if (decision === D.SAME) {
+      const target = cat_.codes[C_(v[COL['Correct product (SKU code, only for 🔁)']])];
+      if (!target) result = 'Pick a valid SKU code in column M';
+      else result = sameAs_(data, target, namesSh, boardsSh, note);
+    } else if (decision === D.IGNORE) result = 'Ignored';
+    else if (decision === D.FIX) result = 'Waiting: fix the entry in the app sheet (or add a correction)';
+    if (result && result !== status) { sh.getRange(i + 2, COL['Status'] + 1).setValue(result); if (/^Done/.test(result)) applied++; }
+  });
+  return applied;
+}
+
+function addSku_(skuSh, row) {
+  skuSh.appendRow(row);
+  skuSh.getRange(skuSh.getLastRow(), 1, 1, 7).setBackground('#d9f2d9');
+}
+
+/** "This entry is really product X": merge whichever names differ, if only names differ. */
+function sameAs_(data, t, namesSh, boardsSh, note) {
+  const w = data.want;
+  if (!w) return 'Can\'t merge this kind of problem — choose ✏️';
+  if (data.kind === 'boardNew' || (data.kind === 'board')) {
+    if (t.cat !== 'BLOCKBOARD') return 'Column M must be a Blockboard code';
+    const type = t.variety.replace(/ (MR|PF)$/, '');
+    boardsSh.appendRow([w.core, w.frame, w.filler, type, 'YES']);
+    return 'Done ✔ ' + [w.core, w.frame, w.filler].join(' / ') + ' = ' + type;
+  }
+  if (t.cat !== w.cat || t.thk !== w.thk || t.size !== w.size || (w.cat === 'SHUTTERING' && t.weight !== w.weight)) {
+    return 'Can\'t merge: size, thickness or weight differ — fix the entry (✏️) or add as new product (➕)';
+  }
+  const merged = [];
+  if (w.cat === 'SHUTTERING') {
+    if (t.brand !== w.brand) { namesSh.appendRow(['Shuttering', w.brand, t.brand, 'YES', note]); merged.push(w.brand + ' = ' + t.brand); }
+    if (t.glue !== '*' && t.glue !== w.glue) return 'Can\'t merge: glue differs (' + w.glue + ' vs ' + t.glue + ')';
+  } else {
+    if (t.variety !== w.variety) { namesSh.appendRow([NICE[w.cat], w.variety, t.variety, 'YES', note]); merged.push(w.variety + ' = ' + t.variety); }
+    if (t.face !== w.face) { namesSh.appendRow([NICE[w.cat], w.face, t.face, 'YES', note]); merged.push(w.face + ' = ' + t.face); }
+  }
+  return merged.length ? 'Done ✔ merged: ' + merged.join(', ') : 'Done ✔ already the same product';
+}
+
+/************ BUILDING THE REVIEW TAB ************/
+function reviewRows_(L, cat_, boardsValues, existing) {
+  const out = [], seen = {};
+  let nextId = existing.reduce((m, r) => Math.max(m, Number(r[COL['ID']]) || 0), 0) + 1;
+  const byKey = {}; existing.forEach((r) => { byKey[r[COL['Key']]] = r; });
+  // One Blockboard-type question per Core / Frame / Filler (not one per size)
+  const grouped = {}, list = [];
+  L.issues.filter((i) => i.source !== 'New SKU').forEach((i) => {
+    if (i.why !== 'Blockboard type not set for this Core / Frame / Filler' || !i.want) { list.push(i); return; }
+    const w = JSON.parse(i.want), k = 'BOARDTYPE|' + [w.core, w.frame, w.filler].join('|');
+    const g = grouped[k] || (grouped[k] = Object.assign({}, i, { key: k, item: 'Blockboard (all sizes) · core ' + w.core + ' · frame ' + w.frame + ' · filler ' + w.filler, qty: 0, times: 0, first: i.first, last: i.last }));
+    g.qty += i.qty; g.times += i.times;
+    if (i.first && (!g.first || i.first < g.first)) g.first = i.first;
+    if (i.last && (!g.last || i.last > g.last)) g.last = i.last;
+  });
+  Object.keys(grouped).forEach((k) => { if (grouped[k].source !== 'Production') grouped[k].source = 'Production'; list.push(grouped[k]); });
+  list.forEach((i) => {
+    seen[i.key] = true;
+    const s = suggest_(i, cat_, boardsValues);
+    const old = byKey[i.key];
+    const decided = old && String(old[COL['Manager decision']]) && String(old[COL['Manager decision']]) !== D.PENDING;
+    const row = new Array(HEAD.length).fill('');
+    row[COL['ID']] = old ? old[COL['ID']] : nextId++;
+    row[COL['Found in']] = i.source;
+    row[COL['Entered as']] = i.item;
+    row[COL['Problem']] = decided ? old[COL['Problem']] : s.problem;
+    row[COL['Suggestion']] = decided ? old[COL['Suggestion']] : s.suggestion;
+    row[COL['Match %']] = decided ? old[COL['Match %']] : s.match;
+    row[COL['Suggested action']] = decided ? old[COL['Suggested action']] : s.action;
+    row[COL['Pieces']] = i.qty;
+    row[COL['Entries']] = i.times;
+    row[COL['First date']] = i.first || '';
+    row[COL['Last date']] = i.last || '';
+    row[COL['Manager decision']] = old ? (old[COL['Manager decision']] || D.PENDING) : D.PENDING;
+    row[COL['Correct product (SKU code, only for 🔁)']] = old ? old[COL['Correct product (SKU code, only for 🔁)']] : '';
+    row[COL['Remark / discussion']] = old ? old[COL['Remark / discussion']] : '';
+    row[COL['Decided by']] = old ? old[COL['Decided by']] : '';
+    const oldStatus = old ? String(old[COL['Status']]) : '';
+    row[COL['Status']] = oldStatus && !/^New/.test(oldStatus) ? oldStatus : 'New – waiting for decision';
+    if (/^Done/.test(oldStatus)) row[COL['Status']] = oldStatus + ' (still found — check)';
+    row[COL['Key']] = i.key;
+    row[COL['Data']] = JSON.stringify(decided && old[COL['Data']] ? JSON.parse(old[COL['Data']]) : s.data);
+    out.push(row);
+  });
+  existing.forEach((r) => {
+    if (seen[r[COL['Key']]]) return;
+    const st = String(r[COL['Status']]).replace(/ \(still found — check\)$/, '');
+    const copy = r.slice();
+    copy[COL['Status']] = /^Done|^Ignored|^Resolved/.test(st) ? st : 'Resolved ✔ no longer found';
+    out.push(copy);
+  });
+  const open = (r) => !/^Done|^Ignored|^Resolved/.test(String(r[COL['Status']]));
+  out.sort((a, b) => (open(b) - open(a)) || (Number(b[COL['Pieces']]) - Number(a[COL['Pieces']])) || (Number(a[COL['ID']]) - Number(b[COL['ID']])));
+  return out;
+}
+
+function buildReview_() {
+  const src = readSources_();
+  const L = buildLedger_(src);
+  const cat_ = catalog_(src.skus);
+  const ss = SpreadsheetApp.openById(SRC.INPUTS_ID);
+  const sh = ss.getSheetByName(REVIEW_TAB) || makeReviewTab_(ss);
+  const existing = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, HEAD.length).getValues().filter((r) => r[COL['Key']]) : [];
+  const rows = reviewRows_(L, cat_, src.boards, existing);
+  if (sh.getMaxRows() < rows.length + 1) sh.insertRowsAfter(sh.getMaxRows(), rows.length + 1 - sh.getMaxRows());
+  sh.getRange(2, 1, Math.max(sh.getMaxRows() - 1, 1), HEAD.length).clearContent();
+  if (rows.length) sh.getRange(2, 1, rows.length, HEAD.length).setValues(rows);
+  sh.getRange(1, 1, 1, 1).setNote('Last checked ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd-MM-yyyy HH:mm'));
+}
+
+function makeReviewTab_(ss) {
+  return formatReviewTab_(ss, ss.insertSheet(REVIEW_TAB, 1));
+}
+
+function formatReviewTab_(ss, sh) {
+  sh.getRange(1, 1, 1, HEAD.length).setValues([HEAD]).setFontWeight('bold').setBackground('#eeeeee').setWrap(true);
+  sh.setFrozenRows(1); sh.setFrozenColumns(3);
+  const dec = SpreadsheetApp.newDataValidation().requireValueInList([D.PENDING, D.APPROVE, D.SAME, D.ADD, D.FIX, D.IGNORE], true).setAllowInvalid(false).build();
+  sh.getRange(2, COL['Manager decision'] + 1, 998, 1).setDataValidation(dec).setBackground('#fff2cc');
+  sh.getRange(2, COL['Correct product (SKU code, only for 🔁)'] + 1, 998, 1).setBackground('#fff2cc')
+    .setDataValidation(SpreadsheetApp.newDataValidation().requireValueInRange(ss.getRange("'Product List'!G2:G"), true).setAllowInvalid(true).build());
+  sh.getRange(2, COL['Remark / discussion'] + 1, 998, 2).setBackground('#fff2cc');
+  const widths = [40, 80, 300, 300, 300, 60, 130, 70, 60, 90, 90, 200, 200, 260, 160, 260];
+  widths.forEach((w, i) => sh.setColumnWidth(i + 1, w));
+  sh.hideColumns(COL['Key'] + 1, 2);
+  const st = sh.getRange(2, COL['Status'] + 1, 998, 1);
+  const rule = (txt, c) => SpreadsheetApp.newConditionalFormatRule().whenTextStartsWith(txt).setBackground(c).setRanges([st]).build();
+  sh.setConditionalFormatRules([rule('New', '#fde2e1'), rule('Done', '#d9f2d9'), rule('Resolved', '#d9f2d9'), rule('Waiting', '#fff2cc'), rule('Can', '#fde2e1'), rule('Pick', '#fde2e1'), rule('Ignored', '#eeeeee')]);
+  return sh;
+}
