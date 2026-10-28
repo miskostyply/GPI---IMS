@@ -1,0 +1,511 @@
+/**
+ * STOCK LEDGER (IMS) — ONE WORKBOOK  ·  v4, 26 Oct 2026
+ * Lives inside "IMS_MAIN DATA_2026" only. Same menu, same month tabs, same layout as v3:
+ *   row 1 = dates, row 2 = Category | type | Weight | face | thickness | size | 0S | PRO | DIS | BS ...,
+ *   row 3 = TOTAL — ALL PRODUCTS, row 4+ = products.
+ *
+ * What changed in v4: the numbers now come from the SAME calculation as the
+ * "GPI Finished Goods Stock" dashboard and the "GPI Stock Report (for Tally)" sheet,
+ * so all three always show the same stock.
+ *  - Products = the New SKU list (FINISH GOODS) — one row per product, no duplicates.
+ *  - Opening stock, corrections, same-name pairs and Blockboard types come from the
+ *    "GPI IMS Inputs" sheet (no more editing this code for them).
+ *  - BS = the dashboard's closing stock. It includes corrections and physical counts
+ *    (a note on that BS cell says which) and can go below zero (shown in red).
+ *  - Entries that could not be counted are listed at the bottom in orange (note = why).
+ *  - Month tabs before the stock start date (e.g. SEPTEMBER-26) are left as they are.
+ */
+
+/************ CONFIG — sources (only touch if a file is replaced) ************/
+const PRODUCTION_SHEET_ID = '1rp2zjWP_fCwk58iByfX55kFgdM0seJmfcCPs39KoYIQ'; // "Production - 2026"
+const DISPATCH_SHEET_ID   = '1s7iCW87CdKvKxrlXUXN0FuFG3uAGbflWhO4KWvM7dxg'; // "Dispatch System Database"
+const DISPATCH_TAB_NAME   = 'Dispatch Log';
+const NEW_SKU_SHEET_ID    = '1kaEncrPmLT_hzzTc7lu9iIxLUbYyVxH5KNcsMDc1liM'; // "New SKU"
+const NEW_SKU_TAB_NAME    = 'FINISH GOODS';
+const INPUTS_SHEET_ID     = '1LSRzYeVEdXXhlb1rqpJp4nWvZxfJuPUN0LdwRH2pdLo'; // "GPI IMS Inputs"
+
+const MONTH_NAMES_UPPER = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE',
+  'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER'];
+const LEDGER_ID_HEADERS = ['Category', 'type', 'Weight', 'face', 'thickness', 'size'];
+const TOTAL_ROW = 3;
+const FIRST_PRODUCT_ROW = 4;
+const COLOR_NOT_COUNTED = '#f9cb9c'; // orange — entries that could not be counted
+const LEGEND = 'Same numbers as the stock dashboard.  🟧 bottom rows = entries not counted (see note)   Red = below zero   Note on a BS cell = physical count or correction';
+
+/************ MENU ************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('📦 Stock Ledger')
+    .addItem('🔄 Refresh Everything', 'refreshAllData')
+    .addItem('🧱 Rebuild ALL months', 'rebuildAllMonths')
+    .addToUi();
+}
+
+function refreshAllData() { runRefresh_(false); }
+function rebuildAllMonths() { runRefresh_(true); }
+
+function runRefresh_(allMonths) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) { Logger.log('Refresh skipped — a previous run was still in progress.'); return; }
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const src = readSources_();
+    const L = buildLedger_(src);
+    const info = L.info[0] || {};
+    if (!info.start) { ss.toast('No production or dispatch data found.', 'Stock Ledger', 8); return; }
+
+    const tz = Session.getScriptTimeZone();
+    const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+    const fillEnd = today > info.end ? today : info.end;
+    const products = productList_(src.skus);
+    const months = monthsBetween_(info.start, fillEnd);
+    const toDo = allMonths ? months : months.slice(-2);
+    const done = [], errors = [];
+    toDo.forEach((m) => {
+      try { writeMonth_(ss, m, products, L, fillEnd); done.push(m.ledgerTab); }
+      catch (e) { errors.push(m.ledgerTab + ' (' + e.message + ')'); }
+    });
+    let msg = 'Stock from ' + info.start + ' to ' + fillEnd + '. Updated: ' + done.join(', ') + '. Not counted: ' + L.issues.length + ' item(s), see bottom rows.';
+    if (errors.length) msg += ' Failed: ' + errors.join(', ');
+    ss.toast(msg, 'Stock Ledger refreshed', 8);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/************ READING (same sources and rules as the dashboard) ************/
+function readSources_() {
+  const tabOf = (ss, name) => { const sh = ss.getSheetByName(name); return sh ? sh.getDataRange().getDisplayValues() : []; };
+  const prodSS = SpreadsheetApp.openById(PRODUCTION_SHEET_ID);
+  const prodTabs = prodSS.getSheets()
+    .filter((sh) => MONTH_NAMES_UPPER.indexOf(String(sh.getName()).trim().toUpperCase()) > -1)
+    .map((sh) => sh.getDataRange().getDisplayValues());
+  const inputs = SpreadsheetApp.openById(INPUTS_SHEET_ID);
+  return {
+    skus: tabOf(SpreadsheetApp.openById(NEW_SKU_SHEET_ID), NEW_SKU_TAB_NAME),
+    prodTabs,
+    disp: tabOf(SpreadsheetApp.openById(DISPATCH_SHEET_ID), DISPATCH_TAB_NAME),
+    opening: tabOf(inputs, 'Opening Stock'),
+    corrections: tabOf(inputs, 'Corrections'),
+    names: tabOf(inputs, 'Same Names'),
+    boards: tabOf(inputs, 'Blockboard Types')
+  };
+}
+
+function iso_(s) {
+  s = String(s || '').trim();
+  let m = /^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})/.exec(s);
+  if (m) return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+  m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
+  return m ? m[1] + '-' + m[2].padStart(2, '0') + '-' + m[3].padStart(2, '0') : '';
+}
+
+function table_(v, map) {
+  const h = (v[0] || []).map((x) => String(x).trim());
+  return v.slice(1).filter((r) => r.some((c) => String(c).trim())).map((r) => {
+    const o = {};
+    Object.keys(map).forEach((k) => { const i = h.indexOf(map[k]); o[k] = i > -1 && i < r.length ? String(r[i]).trim() : ''; });
+    return o;
+  });
+}
+
+function skuRows_(v) {
+  return table_(v, { cat: 'CATEGEORY', thk: 'THICKNESS', variety: 'VARIETY', glueType: 'GLUE Type', face: 'FACE', size: 'SIZE', sku: 'SKU' }).filter((r) => r.sku);
+}
+
+function buildLedger_(src) {
+  const production = [].concat(...src.prodTabs.map((v) => table_(v, { day: 'date', category: 'category', thickness: 'thickness', glue: 'glue', coreThick: 'coreThick', frame: 'frame', filler: 'filler', plyType: 'plyType', face: 'face', brand: 'brand', weight: 'weight', size: 'size', pcs: 'pcs' })))
+    .filter((r) => r.category && !/TEST/i.test(r.category))
+    .map((r) => Object.assign(r, { day: iso_(r.day), pcs: Number(r.pcs) || 0 }));
+  const dispatch = table_(src.disp, { ts: 'Timestamp', id: 'Dispatch ID', bill: 'Bill No', category: 'Category', thickness: 'Thickness', face: 'Face', glue: 'Glue', weight: 'Weight', size: 'Size', qty: 'Quantity', dd: 'Dispatch Date' })
+    .filter((r) => r.category)
+    .map((r) => ({ day: iso_(r.dd) || iso_(r.ts), id: r.id, bill: r.bill, category: r.category, thickness: r.thickness, face: r.face, glue: r.glue, weight: r.weight, size: r.size, qty: Number(r.qty) || 0 }));
+  const dated = (rows) => rows.map((r) => Object.assign(r, { day: iso_(r.day) }));
+  const opening = dated(table_(src.opening, { day: 'Count date', sku: 'SKU code', qty: 'Pieces', note: 'Note' }));
+  const corrections = dated(table_(src.corrections, { day: 'Date', sku: 'SKU code', qty: 'Pieces (+ add, - remove)', reason: 'Reason', by: 'Entered by' }));
+  const names = table_(src.names, { category: 'Category', from: 'Name used in apps', to: 'Same as (New SKU name)', ok: 'Confirmed (YES/NO)' });
+  const boards = table_(src.boards, { coreThick: 'Core thickness', frame: 'Frame', filler: 'Filler', type: 'New SKU type', ok: 'Confirmed (YES/NO)' });
+  return ledger_(skuRows_(src.skus), production, dispatch, opening, corrections, names, boards);
+}
+
+// The stock calculation. Keep it identical to the dashboard's "Stock ledger".
+const ledger_ = (skus, production, dispatch, opening, corrections, names, boards) => {
+  const C = (s) => String(s == null ? '' : s).toUpperCase().replace(/\s+/g, ' ').trim();
+  const N = (s) => { const m = /(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s)); return m ? String(parseFloat(m[1])) : ''; };
+  const S = (s) => { const m = /(\d+(?:\.\d+)?)[^\d.]+?(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s)); return m ? parseFloat(m[1]) + 'X' + parseFloat(m[2]) : ''; };
+  const CATS = { DOOR: 'DOOR', DOORS: 'DOOR', BLOCKBOARD: 'BLOCKBOARD', 'BLOCK BOARD': 'BLOCKBOARD', BOARD: 'BLOCKBOARD', BOARDS: 'BLOCKBOARD', PLYWOOD: 'PLYWOOD', PLY: 'PLYWOOD', SHUTTERING: 'SHUTTERING' };
+  const CAT = (s) => CATS[C(s)] || '';
+  const YES = (s) => /^Y/i.test(String(s == null ? '' : s).trim());
+  const EXAMPLE = (s) => /^EXAMPLE/i.test(String(s == null ? '' : s).trim());
+  const NICE = { DOOR: 'Door', BLOCKBOARD: 'Blockboard', PLYWOOD: 'Plywood', SHUTTERING: 'Shuttering' };
+
+  // Same Names (only rows marked YES): category|old name -> New SKU name
+  const alias = {};
+  names.forEach((r) => { if (YES(r.ok) && C(r.from) && C(r.to)) alias[(CAT(r.category) || '*') + '|' + C(r.from)] = C(r.to); });
+  const A = (cat, v) => alias[cat + '|' + v] || alias['*|' + v] || v;
+  // Blockboard Types (only rows marked YES); a blank cell means any
+  const types = boards.filter((r) => YES(r.ok) && C(r.type));
+  const boardType = (r) => {
+    const hit = {};
+    types.forEach((t) => {
+      if (C(t.coreThick) && N(t.coreThick) !== N(r.coreThick)) return;
+      if (C(t.frame) && C(t.frame) !== C(r.frame)) return;
+      if (C(t.filler) && C(t.filler) !== C(r.filler)) return;
+      hit[C(t.type)] = true;
+    });
+    const k = Object.keys(hit);
+    return k.length === 1 ? k[0] : '';
+  };
+
+  // Products = New SKU rows. A product is its details; its code(s) are labels.
+  const prod = {}, idsOfCode = {};
+  skus.forEach((r) => {
+    const cat = CAT(r.cat), thk = N(r.thk), size = S(r.size), code = C(r.sku);
+    if (!cat || !thk || !size || !code) return;
+    let id;
+    if (cat === 'SHUTTERING') {
+      const v = C(r.variety).replace(/ /g, ''), w = (/(\d+(?:\.\d+)?)KG/.exec(v) || [])[1];
+      if (!w) return;
+      const gt = C(r.glueType), glue = (gt === 'PF' || gt === 'MR') ? gt : ((/(PF|MR)$/.exec(v) || [])[1] || '*');
+      id = ['SHUTTERING', thk, N(w), glue, C(r.face), size].join('|');
+    } else id = [cat, thk, C(r.variety), C(r.face), size].join('|');
+    if (!prod[id]) prod[id] = { id, cat, codes: [], name: [NICE[cat], C(r.thk), C(r.variety), C(r.face), C(r.size)].filter(Boolean).join(' ') };
+    if (prod[id].codes.indexOf(code) === -1) prod[id].codes.push(code);
+    (idsOfCode[code] = idsOfCode[code] || {})[id] = true;
+  });
+
+  // Which product a production or dispatch row is
+  const match = (r, fromProduction) => {
+    const cat = CAT(r.category), thk = N(r.thickness), size = S(r.size);
+    if (!cat) return { why: '' };
+    if (!thk || !size) return { why: 'A product detail is empty' };
+    if (cat === 'SHUTTERING') {
+      const w = N(r.weight), g = C(r.glue), b = A(cat, C(r.face || r.brand));
+      if (!w || !b) return { why: 'A product detail is empty' };
+      const k = ['SHUTTERING', thk, w, g, b, size].join('|'), kw = ['SHUTTERING', thk, w, '*', b, size].join('|');
+      return prod[k] ? { id: k } : prod[kw] ? { id: kw } : { why: 'Not in New SKU', want: { cat, thk, weight: w, glue: g, brand: b, size } };
+    }
+    let v = C(r.glue);
+    if (fromProduction) {
+      if (cat === 'DOOR') v = /^(MR[ .-]*)?JABRA$/.test(v) ? 'JABRA' : /^MR[ .-]*FRESH$/.test(v) ? 'MR' : v;
+      else if (cat === 'PLYWOOD') {
+        const p = C(r.plyType), t = /^RED/.test(p) ? 'RED' : /^ALT/.test(p) ? 'ALT' : /GENERAL/.test(p) ? 'GENERAL' : p.replace(/ ?\b(MR|PF)$/, '');
+        v = ((t ? t + ' ' : '') + (v || (/\b(MR|PF)\b/.exec(p) || [])[1] || '')).trim();
+      } else if (/JABRA/.test(v)) v = 'JABRA';
+      else if (/PINE|MIXWOOD/.test(v)) { /* the app already wrote the New SKU type, e.g. FRESH 2.5M PINE FRAME MR */ }
+      else {
+        const t = boardType(r);
+        if (!t) return { why: 'Blockboard type not set for this Core / Frame / Filler', want: { cat, thk, glue: v === 'PF' ? 'PF' : 'MR', core: C(r.coreThick), frame: C(r.frame), filler: C(r.filler), face: A(cat, C(r.face)), size } };
+        v = t + ' ' + (v === 'PF' ? 'PF' : 'MR');
+      }
+    }
+    const k = [cat, thk, A(cat, v), A(cat, C(r.face)), size].join('|');
+    return prod[k] ? { id: k } : { why: 'Not in New SKU', want: { cat, thk, variety: A(cat, v), face: A(cat, C(r.face)), size } };
+  };
+  const byCode = (code) => {
+    const ids = Object.keys(idsOfCode[C(code)] || {});
+    return !ids.length ? { why: 'Code not in New SKU' } : ids.length > 1 ? { why: 'New SKU uses this code for ' + ids.length + ' products' } : { id: ids[0] };
+  };
+
+  // Things that could not be counted
+  const bad = {};
+  const NEXT = {
+    'Not in New SKU': 'Add the product to New SKU, or add its old name in the Same Names tab',
+    'Blockboard type not set for this Core / Frame / Filler': 'Fill in the Blockboard Types tab and type YES',
+    'A product detail is empty': 'Fix the entry in the app sheet, or add a correction',
+    'Code not in New SKU': 'Check the SKU code in the inputs sheet',
+    'Date or pieces missing': 'Check the row in the inputs sheet'
+  };
+  const raw = [];
+  const note = (source, item, why, qty, day, want) => { raw.push({ source, item, why, qty, day, want: want ? JSON.stringify(want) : '' }); };
+  const describe = (r, src) => {
+    const cat = CAT(r.category);
+    const extra = src === 'Production' && cat === 'BLOCKBOARD' ? [r.coreThick, r.frame, r.filler].filter(Boolean).join('/') : '';
+    const kind = src === 'Production' && cat === 'PLYWOOD' ? r.plyType : '';
+    return [NICE[cat] || r.category, r.thickness, cat === 'SHUTTERING' ? r.weight : '', kind, r.glue, extra, r.face || r.brand, r.size].map((x) => String(x == null ? '' : x).trim()).filter(Boolean).join(' · ');
+  };
+
+  // Movements
+  const moves = {}; // id -> day -> [produced, dispatched, corrected]
+  const add = (id, day, i, q) => { const d = (moves[id] = moves[id] || {}); (d[day] = d[day] || [0, 0, 0])[i] += q; };
+  production.forEach((r) => {
+    const q = Number(r.pcs) || 0;
+    if (!r.day || !q) return;
+    const m = match(r, true);
+    if (m.id) add(m.id, r.day, 0, q); else if (m.why) note('Production', describe(r, 'Production'), m.why, q, r.day, m.want);
+  });
+  dispatch.forEach((r) => {
+    const q = Number(r.qty) || 0;
+    if (!r.day || !q) return;
+    const m = match(r, false);
+    if (m.id) add(m.id, r.day, 1, q); else if (m.why) note('Dispatch', describe(r, 'Dispatch'), m.why, q, r.day, m.want);
+  });
+  corrections.forEach((r) => {
+    if (EXAMPLE(r.reason)) return;
+    const q = Number(r.qty);
+    if (!r.sku && !r.day) return;
+    if (!r.day || !isFinite(q) || !q) { note('Corrections tab', String(r.sku || ''), 'Date or pieces missing', 0, r.day || ''); return; }
+    const m = byCode(r.sku);
+    if (m.id) add(m.id, r.day, 2, q); else note('Corrections tab', C(r.sku), m.why, q, r.day);
+  });
+  const counts = {}; // id -> day -> pieces counted
+  opening.forEach((r) => {
+    if (EXAMPLE(r.note)) return;
+    const q = Number(r.qty);
+    if (!r.sku && !r.day) return;
+    if (!r.day || !isFinite(q)) { note('Opening Stock tab', String(r.sku || ''), 'Date or pieces missing', 0, r.day || ''); return; }
+    const m = byCode(r.sku);
+    if (!m.id) { note('Opening Stock tab', C(r.sku), m.why, q, r.day); return; }
+    const c = (counts[m.id] = counts[m.id] || {});
+    c[r.day] = (c[r.day] || 0) + q;
+  });
+  Object.keys(idsOfCode).forEach((code) => {
+    const ids = Object.keys(idsOfCode[code]);
+    if (ids.length > 1) note('New SKU', code, 'Same code used for ' + ids.length + ' products: ' + ids.map((i) => prod[i].name).join(' | '), 0, '');
+  });
+
+  // Dates: from the first count (or, with no count yet, the 1st of the latest month) to the latest entry
+  const countDays = [].concat(...Object.values(counts).map((c) => Object.keys(c))).sort();
+  const moveDays = [].concat(...Object.values(moves).map((m) => Object.keys(m))).sort();
+  const latest = [countDays[countDays.length - 1] || '', moveDays[moveDays.length - 1] || ''].sort()[1];
+  const start = countDays[0] || (latest ? latest.slice(0, 8) + '01' : '');
+  const days = [];
+  if (start) {
+    const d = new Date(start + 'T00:00:00Z'), endD = new Date(latest + 'T00:00:00Z');
+    while (d <= endD) { days.push(d.toISOString().slice(0, 10)); d.setUTCDate(d.getUTCDate() + 1); }
+  }
+
+  // Day-by-day stock for every product with a count or a movement
+  const stock = [], totals = {};
+  days.forEach((day) => { totals[day] = { day, closing: 0, produced: 0, dispatched: 0, corrected: 0, inStock: 0, belowZero: 0 }; });
+  Object.keys(prod).forEach((id) => {
+    const c = counts[id] || {}, m = moves[id] || {};
+    if (!days.some((day) => c[day] !== undefined || m[day])) return;
+    const p = prod[id];
+    let bal = 0;
+    days.forEach((day) => {
+      const open = c[day] !== undefined ? c[day] : bal;
+      const mv = m[day] || [0, 0, 0];
+      bal = open + mv[0] - mv[1] + mv[2];
+      stock.push({ key: id + '|' + day, product: id, code: p.codes.join(' / '), name: p.name, category: NICE[p.cat], day,
+        opening: open, produced: mv[0], dispatched: mv[1], corrected: mv[2], closing: bal, counted: c[day] !== undefined ? 'yes' : '' });
+      const t = totals[day];
+      t.closing += bal; t.produced += mv[0]; t.dispatched += mv[1]; t.corrected += mv[2];
+      if (bal > 0) t.inStock += 1; if (bal < 0) t.belowZero += 1;
+    });
+  });
+  raw.forEach((x) => {
+    if (x.day && start && x.day < start) return;
+    const key = x.source + '|' + x.item + '|' + x.why;
+    const b = bad[key] || (bad[key] = { key, source: x.source, item: x.item, why: x.why, qty: 0, times: 0, first: x.day, last: x.day, next: NEXT[x.why] || 'Give each product its own code in New SKU', want: x.want || '' });
+    b.qty += x.qty; b.times += 1;
+    if (x.day && (!b.first || x.day < b.first)) b.first = x.day;
+    if (x.day && (!b.last || x.day > b.last)) b.last = x.day;
+  });
+  const issues = Object.values(bad).sort((a, b) => b.qty - a.qty || b.times - a.times);
+  return {
+    info: [{ start, end: latest, counted: countDays.length > 0 ? 'yes' : 'no', products: Object.keys(prod).length, issues: issues.length }],
+    stock, totals: days.map((d) => totals[d]), issues
+  };
+};
+
+/************ PRODUCT ROWS — one per New SKU product (same product identity as the ledger) ************/
+function productList_(skuValues) {
+  const C = (s) => String(s == null ? '' : s).toUpperCase().replace(/\s+/g, ' ').trim();
+  const N = (s) => { const m = /(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s)); return m ? String(parseFloat(m[1])) : ''; };
+  const S = (s) => { const m = /(\d+(?:\.\d+)?)[^\d.]+?(\d+(?:\.\d+)?)/.exec(String(s == null ? '' : s)); return m ? parseFloat(m[1]) + 'X' + parseFloat(m[2]) : ''; };
+  const CATS = { DOOR: 'DOOR', DOORS: 'DOOR', BLOCKBOARD: 'BLOCKBOARD', 'BLOCK BOARD': 'BLOCKBOARD', BOARD: 'BLOCKBOARD', BOARDS: 'BLOCKBOARD', PLYWOOD: 'PLYWOOD', PLY: 'PLYWOOD', SHUTTERING: 'SHUTTERING' };
+  const out = {};
+  skuRows_(skuValues).forEach((r) => {
+    const cat = CATS[C(r.cat)] || '', thk = N(r.thk), size = S(r.size), code = C(r.sku);
+    if (!cat || !thk || !size || !code) return;
+    let id, cols;
+    if (cat === 'SHUTTERING') {
+      const v = C(r.variety).replace(/ /g, ''), w = (/(\d+(?:\.\d+)?)KG/.exec(v) || [])[1];
+      if (!w) return;
+      const gt = C(r.glueType), glue = (gt === 'PF' || gt === 'MR') ? gt : ((/(PF|MR)$/.exec(v) || [])[1] || '*');
+      id = ['SHUTTERING', thk, N(w), glue, C(r.face), size].join('|');
+      cols = ['SHUTTERING', C(r.face), N(w) + 'KG' + (glue === '*' ? '' : ' ' + glue), '', thk + 'MM', size];
+    } else {
+      id = [cat, thk, C(r.variety), C(r.face), size].join('|');
+      cols = [cat, C(r.variety), '', C(r.face), thk + 'MM', size];
+    }
+    if (!out[id]) out[id] = { id, cols, codes: [] };
+    if (out[id].codes.indexOf(code) === -1) out[id].codes.push(code);
+  });
+  const num = (t) => { const m = String(t).match(/[\d.]+/); return m ? parseFloat(m[0]) : 0; };
+  return Object.values(out).sort((a, b) => {
+    const x = a.cols, y = b.cols;
+    if (x[0] !== y[0]) return x[0] < y[0] ? -1 : 1;
+    if (x[1] !== y[1]) return x[1] < y[1] ? -1 : 1;
+    if (num(x[2]) !== num(y[2])) return num(x[2]) - num(y[2]);
+    if (x[2] !== y[2]) return x[2] < y[2] ? -1 : 1;
+    if (x[3] !== y[3]) return x[3] < y[3] ? -1 : 1;
+    if (num(x[4]) !== num(y[4])) return num(x[4]) - num(y[4]);
+    if (num(x[5]) !== num(y[5])) return num(x[5]) - num(y[5]);
+    return x[5] < y[5] ? -1 : x[5] > y[5] ? 1 : 0;
+  });
+}
+
+/************ MONTHS ************/
+function monthsBetween_(startIso, endIso) {
+  const list = [];
+  let y = +startIso.slice(0, 4), m = +startIso.slice(5, 7);
+  const ey = +endIso.slice(0, 4), em = +endIso.slice(5, 7);
+  while (y < ey || (y === ey && m <= em)) {
+    const first = (y === +startIso.slice(0, 4) && m === +startIso.slice(5, 7));
+    list.push({ month: m, year: y, ledgerTab: MONTH_NAMES_UPPER[m - 1] + '-' + String(y).slice(-2), startDay: first ? +startIso.slice(8, 10) : 1 });
+    m++; if (m > 12) { m = 1; y++; }
+  }
+  return list;
+}
+
+function getOrCreateMonthTab_(ss, tabName) {
+  let sheet = ss.getSheetByName(tabName);
+  if (sheet) return sheet;
+  sheet = ss.insertSheet(tabName, 0);
+  sheet.setFrozenRows(TOTAL_ROW);
+  sheet.setFrozenColumns(6);
+  return sheet;
+}
+
+/**
+ * Builds one month's grid in memory (no sheet calls), so it can be checked:
+ * rows of numbers in the v3 layout, plus the notes for BS cells.
+ */
+function monthGrid_(m, products, L, fillEnd, blocks) {
+  const iso = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  const byId = {};
+  L.stock.forEach((r) => { (byId[r.product] = byId[r.product] || {})[r.day] = r; });
+  const lastOf = {};
+  Object.keys(byId).forEach((id) => { const days = Object.keys(byId[id]).sort(); lastOf[id] = byId[id][days[days.length - 1]]; });
+  const visible = blocks.filter((b) => iso(b.date) <= fillEnd);
+  const width = visible.length ? (visible[visible.length - 1].col + (visible[visible.length - 1].hasOpening ? 3 : 2)) - blocks[0].col + 1 : 0;
+  const values = [], notes = visible.map(() => []);
+  products.forEach((p) => {
+    const row = new Array(width).fill('');
+    const days = byId[p.id] || {};
+    visible.forEach((b, bi) => {
+      const day = iso(b.date);
+      let r = days[day];
+      if (!r) { const last = lastOf[p.id]; const bal = last && day > last.day ? last.closing : 0; r = { opening: bal, produced: 0, dispatched: 0, corrected: 0, closing: bal, counted: '' }; }
+      const o = b.col - blocks[0].col;
+      if (b.hasOpening) { row[o] = r.opening; row[o + 1] = r.produced; row[o + 2] = r.dispatched; row[o + 3] = r.closing; }
+      else { row[o] = r.produced; row[o + 1] = r.dispatched; row[o + 2] = r.closing; }
+      const why = [];
+      if (r.counted) why.push('Physical count at the start of this day: ' + r.opening + ' pcs');
+      if (r.corrected) why.push('Correction: ' + (r.corrected > 0 ? '+' : '') + r.corrected + ' pcs (see GPI IMS Inputs > Corrections)');
+      notes[bi].push([why.join('\n')]);
+    });
+    values.push(row);
+  });
+  return { visible, width, values, notes };
+}
+
+/************ WRITING ONE MONTH TAB ************/
+function writeMonth_(ss, m, products, L, fillEnd) {
+  const sheet = getOrCreateMonthTab_(ss, m.ledgerTab);
+  const blocks = ensureHeaderStructure_(sheet, m);
+  const firstCol = blocks[0].col;
+  const prevLastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+
+  const mStart = m.year + '-' + String(m.month).padStart(2, '0') + '-01';
+  const mEnd = m.year + '-' + String(m.month).padStart(2, '0') + '-31';
+  const issues = L.issues.filter((i) => !i.first || (i.first <= mEnd && i.last >= mStart));
+
+  // Identity columns A:F
+  const ids = products.map((p) => p.cols);
+  const issueRows = issues.map((i) => [(i.source + ' — NOT COUNTED').toUpperCase(), i.item, '', '', '', i.qty + ' pcs']);
+  const all = ids.concat(issueRows);
+  const n = all.length;
+  ensureRows_(sheet, FIRST_PRODUCT_ROW + n);
+  sheet.getRange(1, 1).setValue(LEGEND);
+  sheet.getRange(2, 1, 1, 6).setValues([LEDGER_ID_HEADERS]).setFontWeight('bold');
+  sheet.getRange(TOTAL_ROW, 1, 1, 6).setValues([['TOTAL — ALL PRODUCTS', '', '', '', '', '']]).setFontWeight('bold').setBackground('#fce4d6');
+  const clearRows = Math.max(n, prevLastRow - FIRST_PRODUCT_ROW + 1);
+  sheet.getRange(FIRST_PRODUCT_ROW, 1, clearRows, 6).setBackground(null).clearNote();
+  sheet.getRange(FIRST_PRODUCT_ROW, 1, n, 6).setValues(all);
+  sheet.getRange(FIRST_PRODUCT_ROW, 1, products.length, 1).setNotes(products.map((p) => ['SKU code: ' + p.codes.join(' / ')]));
+  if (issueRows.length) {
+    const r0 = FIRST_PRODUCT_ROW + products.length;
+    sheet.getRange(r0, 1, issueRows.length, 6).setBackground(COLOR_NOT_COUNTED);
+    sheet.getRange(r0, 1, issueRows.length, 1).setNotes(issues.map((i) => [
+      'Problem: ' + i.why + '\nPieces left out: ' + i.qty + ' (' + i.times + ' entries' + (i.first ? ', ' + i.first + ' to ' + i.last : '') + ')\nWhat to do: ' + i.next]));
+  }
+  if (prevLastRow >= FIRST_PRODUCT_ROW + n) {
+    sheet.getRange(FIRST_PRODUCT_ROW + n, 1, prevLastRow - FIRST_PRODUCT_ROW - n + 1, Math.max(lastCol, 6)).clearContent().setBackground(null).clearNote();
+  }
+
+  // Numbers
+  const g = monthGrid_(m, products, L, fillEnd, blocks);
+  const lastProductRow = FIRST_PRODUCT_ROW + products.length - 1;
+  const gridCols = sheet.getLastColumn() - firstCol + 1;
+  sheet.getRange(FIRST_PRODUCT_ROW, firstCol, n, gridCols).clearContent().clearNote();
+  if (g.width) {
+    sheet.getRange(FIRST_PRODUCT_ROW, firstCol, products.length, g.width).setValues(g.values);
+    g.visible.forEach((b, bi) => {
+      if (g.notes[bi].some((x) => x[0])) sheet.getRange(FIRST_PRODUCT_ROW, b.hasOpening ? b.col + 3 : b.col + 2, products.length, 1).setNotes(g.notes[bi]);
+    });
+  }
+  blocks.forEach((b) => sheet.getRange(TOTAL_ROW, b.hasOpening ? b.col + 3 : b.col + 2, products.length + 1, 1).setFontWeight('bold'));
+  writeTotalsRow_(sheet, g.visible, firstCol, sheet.getLastColumn(), g.width, FIRST_PRODUCT_ROW, lastProductRow);
+  const grid = sheet.getRange(TOTAL_ROW, firstCol, products.length + 1, Math.max(1, sheet.getLastColumn() - firstCol + 1));
+  sheet.setConditionalFormatRules([SpreadsheetApp.newConditionalFormatRule().whenNumberLessThan(0).setFontColor('#cc0000').setRanges([grid]).build()]);
+}
+
+/************ HEADER, TOTALS, HELPERS (same as v3) ************/
+function monthDateList_(month, year, startDay) {
+  const lastDay = new Date(year, month, 0).getDate();
+  const dates = [];
+  for (let d = startDay; d <= lastDay; d++) dates.push(new Date(year, month - 1, d));
+  return dates;
+}
+
+function ensureHeaderStructure_(sheet, wb) {
+  const dateList = monthDateList_(wb.month, wb.year, wb.startDay || 1);
+  const firstCol = 7;
+  const blockWidths = dateList.map((d, i) => (i === 0 ? 5 : 4));
+  const totalWidth = blockWidths.reduce((a, b) => a + b, 0);
+  const targetLastCol = firstCol + totalWidth - 1;
+  const maxCols = sheet.getMaxColumns();
+  if (maxCols < targetLastCol) sheet.insertColumnsAfter(maxCols, targetLastCol - maxCols);
+  else if (maxCols > targetLastCol) sheet.deleteColumns(targetLastCol + 1, maxCols - targetLastCol);
+  const row1 = new Array(totalWidth).fill(''), row2 = new Array(totalWidth).fill('');
+  const blocks = [];
+  let col = firstCol;
+  dateList.forEach((d, i) => {
+    const off = col - firstCol;
+    row1[off] = d;
+    if (i === 0) { row2[off] = '0S'; row2[off + 1] = 'PRO'; row2[off + 2] = 'DIS'; row2[off + 3] = 'BS'; blocks.push({ col, date: d, hasOpening: true }); }
+    else { row2[off] = 'PRO'; row2[off + 1] = 'DIS'; row2[off + 2] = 'BS'; blocks.push({ col, date: d, hasOpening: false }); }
+    col += blockWidths[i];
+  });
+  sheet.getRange(1, firstCol, 1, totalWidth).setValues([row1]);
+  sheet.getRange(2, firstCol, 1, totalWidth).setValues([row2]);
+  sheet.getRange(1, firstCol, 2, totalWidth).setFontWeight('bold');
+  return blocks;
+}
+
+function writeTotalsRow_(sheet, blocks, firstCol, lastCol, visibleWidth, firstProductRow, lastProductRow) {
+  if (!blocks.length || !visibleWidth) { sheet.getRange(TOTAL_ROW, firstCol, 1, lastCol - firstCol + 1).clearContent(); return; }
+  const rowArr = new Array(visibleWidth).fill('');
+  blocks.forEach((block) => {
+    const cols = block.hasOpening ? [block.col, block.col + 1, block.col + 2, block.col + 3] : [block.col, block.col + 1, block.col + 2];
+    cols.forEach((c) => { const L = colToLetter_(c); rowArr[c - firstCol] = '=SUM(' + L + firstProductRow + ':' + L + lastProductRow + ')'; });
+  });
+  sheet.getRange(TOTAL_ROW, firstCol, 1, visibleWidth).setValues([rowArr]).setFontWeight('bold').setBackground('#fce4d6');
+  const clearStartCol = firstCol + visibleWidth;
+  if (clearStartCol <= lastCol) sheet.getRange(TOTAL_ROW, clearStartCol, 1, lastCol - clearStartCol + 1).clearContent();
+}
+
+function colToLetter_(col) {
+  let letter = '', c = col;
+  while (c > 0) { const rem = (c - 1) % 26; letter = String.fromCharCode(65 + rem) + letter; c = Math.floor((c - 1) / 26); }
+  return letter;
+}
+
+function ensureRows_(sheet, needed) {
+  const max = sheet.getMaxRows();
+  if (needed > max) sheet.insertRowsAfter(max, needed - max);
+}
